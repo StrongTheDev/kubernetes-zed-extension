@@ -1,0 +1,33 @@
+// Kubernetes cluster selection for Zed.
+// Copy these into your global tasks file (command palette: "zed: open tasks")
+// or into a project's .zed/tasks.json. They then appear under "task: spawn".
+[
+  {
+    "label": "Kubernetes: Select kubeconfig…",
+    "command": "kube-lsp",
+    "args": ["select-kubeconfig"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Switch context…",
+    "command": "kube-lsp",
+    "args": ["switch-context"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Use default kubeconfig",
+    "command": "kube-lsp",
+    "args": ["reset-session"],
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Connection status",
+    "command": "kube-lsp",
+    "args": ["status"],
+    "reveal": "always"
+  }
+]

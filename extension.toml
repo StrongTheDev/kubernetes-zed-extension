@@ -1,0 +1,13 @@
+id = "kubernetes"
+name = "Kubernetes"
+version = "0.0.1"
+schema_version = 1
+authors = ["kubernetes-zed-extension contributors"]
+description = "Kubernetes support for Zed: kubectl explain on hover, apply/diff/delete/describe/logs code actions, server-side validation, resource outline, per-session cluster selection, and an MCP server so the Agent can browse your cluster."
+repository = "https://github.com/StrongTheDev/kubernetes-zed-extension"
+
+[language_servers.kube-lsp]
+name = "Kubernetes"
+languages = ["YAML"]
+
+[context_servers.kubernetes]

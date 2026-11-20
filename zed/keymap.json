@@ -1,0 +1,10 @@
+// Optional: add to your keymap (command palette: "zed: open keymap").
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-alt-k": ["task::Spawn", { "task_name": "Kubernetes: Select kubeconfig…" }],
+      "ctrl-alt-shift-k": ["task::Spawn", { "task_name": "Kubernetes: Switch context…" }]
+    }
+  }
+]
