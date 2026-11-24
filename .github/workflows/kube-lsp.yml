@@ -49,7 +49,7 @@ jobs:
         with:
           workspaces: "kube-lsp -> target"
           shared-key: test
-      - run: cargo clippy --all-targets --offline -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
 
   build:
