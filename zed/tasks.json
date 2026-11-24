@@ -1,4 +1,4 @@
-// Kubernetes cluster selection for Zed.
+// Kubernetes tasks for Zed.
 // Copy these into your global tasks file (command palette: "zed: open tasks")
 // or into a project's .zed/tasks.json. They then appear under "task: spawn".
 [
@@ -16,6 +16,30 @@
     "args": ["switch-context"],
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Set default namespace…",
+    "command": "kube-lsp",
+    "args": ["set-namespace"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Stream logs (resource under cursor)",
+    "command": "kube-lsp",
+    "args": ["logs", "--file", "$ZED_FILE", "--line", "$ZED_ROW"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Kubernetes: Stream logs…",
+    "command": "kube-lsp",
+    "args": ["logs"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true,
     "reveal": "always"
   },
   {

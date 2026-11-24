@@ -1,0 +1,28 @@
+# Checks that the Zed extension (WASM) still compiles.
+name: extension
+
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "Cargo.toml", "extension.toml", ".github/workflows/extension.yml"]
+  pull_request:
+    paths: ["src/**", "Cargo.toml", "extension.toml", ".github/workflows/extension.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release --target wasm32-wasip2 -- -D warnings

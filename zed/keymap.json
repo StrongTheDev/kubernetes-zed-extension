@@ -4,7 +4,8 @@
     "context": "Workspace",
     "bindings": {
       "ctrl-alt-k": ["task::Spawn", { "task_name": "Kubernetes: Select kubeconfig…" }],
-      "ctrl-alt-shift-k": ["task::Spawn", { "task_name": "Kubernetes: Switch context…" }]
+      "ctrl-alt-shift-k": ["task::Spawn", { "task_name": "Kubernetes: Switch context…" }],
+      "ctrl-alt-l": ["task::Spawn", { "task_name": "Kubernetes: Stream logs (resource under cursor)" }]
     }
   }
 ]

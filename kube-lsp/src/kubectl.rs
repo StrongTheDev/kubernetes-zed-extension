@@ -12,6 +12,8 @@ pub struct Kubectl {
     pub bin: String,
     pub context: Option<String>,
     pub kubeconfig: Option<String>,
+    /// Default namespace from settings; the session's namespace wins.
+    pub namespace: Option<String>,
     /// When false (the default) the runtime session selection overrides
     /// `context`/`kubeconfig`; see [`crate::session`].
     pub ignore_session: bool,
@@ -23,6 +25,7 @@ impl Default for Kubectl {
             bin: std::env::var("KUBECTL").unwrap_or_else(|_| "kubectl".into()),
             context: None,
             kubeconfig: None,
+            namespace: None,
             ignore_session: false,
         }
     }
@@ -46,13 +49,31 @@ impl Output {
     }
 
     pub fn error_text(&self) -> String {
-        let err = self.stderr.trim();
+        // Drop client-go's internal log lines (`E1120 21:41:52.5 … memcache.go`)
+        // unless they are all there is.
+        let meaningful: Vec<&str> = self.stderr.lines().filter(|l| !is_klog_line(l)).collect();
+        let err = if meaningful.iter().all(|l| l.trim().is_empty()) {
+            self.stderr.trim().to_string()
+        } else {
+            meaningful.join("
+").trim().to_string()
+        };
         if err.is_empty() {
             self.stdout.trim().to_string()
         } else {
-            err.to_string()
+            err
         }
     }
+}
+
+/// `E1120 21:41:52.544276    7896 file.go:381] …` (klog header).
+fn is_klog_line(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 14
+        && matches!(b[0], b'I' | b'W' | b'E' | b'F')
+        && b[1..5].iter().all(u8::is_ascii_digit)
+        && b[5] == b' '
+        && b[8] == b':'
 }
 
 /// Rejects values that kubectl would interpret as flags.
@@ -62,6 +83,22 @@ pub fn safe_arg(value: &str, what: &str) -> Result<String, String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+/// Whether to add the default `--namespace` to a command line.
+fn needs_namespace(args: &[&str]) -> bool {
+    const GLOBAL: &[&str] = &["config", "api-resources", "api-versions", "explain", "version", "cluster-info"];
+    if args.first().is_some_and(|a| GLOBAL.contains(a)) {
+        return false;
+    }
+    // For `logs`, `-f` means --follow, not a manifest file.
+    let file_flags: &[&str] = if args.first() == Some(&"logs") { &["--filename"] } else { &["-f", "--filename"] };
+    !args.iter().any(|a| {
+        matches!(*a, "-n" | "-A" | "--all-namespaces")
+            || file_flags.contains(a)
+            || a.starts_with("--namespace")
+            || a.starts_with("--filename=")
+    })
 }
 
 /// True when an error just means "no reachable cluster", which we treat as
@@ -89,6 +126,7 @@ impl Kubectl {
             bin: self.bin.clone(),
             kubeconfig: Some(path.to_string()),
             context,
+            namespace: None,
             ignore_session: true,
         }
     }
@@ -108,13 +146,36 @@ impl Kubectl {
         }
     }
 
-    /// Stable identity of the cluster we talk to, for cache keys.
-    pub fn identity(&self) -> String {
-        let (k, c) = self.target();
-        format!("{}|{}", k.unwrap_or_default(), c.unwrap_or_default())
+    /// Namespace used when a command or manifest doesn't name one. `None`
+    /// means kubectl's own default (the context's namespace, else `default`).
+    pub fn default_namespace(&self) -> Option<String> {
+        if self.ignore_session {
+            return self.namespace.clone();
+        }
+        let s = crate::session::load();
+        if s.namespace.is_some() || s.kubeconfig.is_some() {
+            s.namespace
+        } else {
+            self.namespace.clone()
+        }
     }
 
-    pub fn exec(&self, args: &[&str], stdin: Option<&str>) -> Output {
+    /// The namespace kubectl will actually use, for display.
+    pub fn effective_namespace(&self) -> String {
+        self.default_namespace().unwrap_or_else(|| {
+            self.run(&["config", "view", "--minify", "-o", "jsonpath={..namespace}"], None)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".into())
+        })
+    }
+
+    /// Builds the command with cluster selection and, where it makes sense,
+    /// the default namespace. Manifest commands (`-f`) are left alone: the
+    /// caller decides, because kubectl rejects a `--namespace` that
+    /// contradicts a namespace written in the manifest.
+    fn command(&self, args: &[&str]) -> Command {
         let (kubeconfig, context) = self.target();
         let mut cmd = Command::new(&self.bin);
         if let Some(c) = &context {
@@ -123,6 +184,32 @@ impl Kubectl {
         if let Some(k) = &kubeconfig {
             cmd.arg("--kubeconfig").arg(k);
         }
+        if needs_namespace(args) {
+            if let Some(ns) = self.default_namespace() {
+                cmd.arg("--namespace").arg(ns);
+            }
+        }
+        cmd
+    }
+
+    /// Runs kubectl attached to the current terminal (for `logs -f`, `exec -it`).
+    /// No request timeout: streams are meant to stay open.
+    pub fn exec_interactive(&self, args: &[&str]) -> Result<i32, String> {
+        self.command(args)
+            .args(args)
+            .status()
+            .map(|s| s.code().unwrap_or(1))
+            .map_err(|e| format!("failed to run `{}`: {e}", self.bin))
+    }
+
+    /// Stable identity of the cluster we talk to, for cache keys.
+    pub fn identity(&self) -> String {
+        let (k, c) = self.target();
+        format!("{}|{}", k.unwrap_or_default(), c.unwrap_or_default())
+    }
+
+    pub fn exec(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        let mut cmd = self.command(args);
         cmd.arg("--request-timeout=15s")
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -226,5 +313,32 @@ impl Kubectl {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_namespace;
+
+    #[test]
+    fn strips_klog_noise() {
+        let out = super::Output {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "E1120 21:41:52.544276    7896 memcache.go:381] \"Couldn't get\"
+Unable to connect to the server: dial tcp".into(),
+        };
+        assert_eq!(out.error_text(), "Unable to connect to the server: dial tcp");
+    }
+
+    #[test]
+    fn namespace_injection_rules() {
+        assert!(needs_namespace(&["get", "pods"]));
+        assert!(needs_namespace(&["logs", "deploy/web", "-f"])); // -f = follow for logs
+        assert!(!needs_namespace(&["get", "pods", "-n", "kube-system"]));
+        assert!(!needs_namespace(&["get", "pods", "--all-namespaces"]));
+        assert!(!needs_namespace(&["apply", "-f", "-"]));
+        assert!(!needs_namespace(&["config", "get-contexts"]));
     }
 }

@@ -14,6 +14,7 @@ pub struct Doc {
     pub kind: Option<String>,
     pub kind_line: Option<usize>,
     pub name: Option<String>,
+    pub name_line: Option<usize>,
     pub namespace: Option<String>,
 }
 
@@ -60,7 +61,7 @@ fn is_separator(line: &str) -> bool {
     line == "---" || line.starts_with("--- ") || line.starts_with("---\t")
 }
 
-fn unquote(s: &str) -> &str {
+pub fn unquote(s: &str) -> &str {
     let s = s.trim();
     let s = s.split(" #").next().unwrap_or(s).trim();
     s.trim_matches(|c| c == '"' || c == '\'')
@@ -158,7 +159,10 @@ fn analyze(lines: &[&str], start: usize, end: usize) -> Doc {
             let indent = *meta_indent.get_or_insert(col);
             if col == indent {
                 match key {
-                    "name" => doc.name = Some(unquote(value).to_string()),
+                    "name" => {
+                        doc.name = Some(unquote(value).to_string());
+                        doc.name_line = Some(i);
+                    }
                     "namespace" => doc.namespace = Some(unquote(value).to_string()),
                     _ => {}
                 }
@@ -204,6 +208,82 @@ pub fn find_path_line(lines: &[&str], doc: &Doc, dotted: &str) -> Option<usize> 
         .collect();
     (doc.start..doc.end)
         .find(|&i| key_of(lines[i]).is_some() && key_path(lines, doc.start, i) == wanted)
+}
+
+/// `key: value` pairs directly under the mapping at `prefix`, e.g.
+/// `["spec", "selector", "matchLabels"]`.
+pub fn pairs_under(lines: &[&str], doc: &Doc, prefix: &[&str]) -> Vec<(String, String)> {
+    (doc.start..doc.end)
+        .filter_map(|i| {
+            let (_, key, value) = key_of(lines[i])?;
+            let value = unquote(value);
+            if value.is_empty() {
+                return None;
+            }
+            let path = key_path(lines, doc.start, i);
+            (path.len() == prefix.len() + 1 && path.iter().zip(prefix).all(|(a, b)| a == b))
+                .then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Labels that pods created by this object carry (Pod, workload templates).
+pub fn pod_labels(lines: &[&str], doc: &Doc) -> Vec<(String, String)> {
+    let prefix: &[&str] = match doc.kind.as_deref() {
+        Some("Pod") => &["metadata", "labels"],
+        Some("Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job" | "ReplicationController") => {
+            &["spec", "template", "metadata", "labels"]
+        }
+        Some("CronJob") => &["spec", "jobTemplate", "spec", "template", "metadata", "labels"],
+        _ => return Vec::new(),
+    };
+    pairs_under(lines, doc, prefix)
+}
+
+/// Sibling `key: value` pairs in the same mapping (or list item) as `line`.
+pub fn siblings(lines: &[&str], doc: &Doc, line: usize) -> Vec<(String, String)> {
+    let Some((col, ..)) = key_of(lines[line]) else { return Vec::new() };
+    let is_item_start = |l: &str| l.trim_start().starts_with("- ");
+    let mut first = line;
+    // Walk up to the start of this mapping / list item.
+    if !is_item_start(lines[line]) {
+        let mut i = line;
+        while i > doc.start {
+            i -= 1;
+            let l = lines[i];
+            if l.trim().is_empty() || l.trim_start().starts_with('#') {
+                continue;
+            }
+            match key_of(l) {
+                Some((c, ..)) if c == col => {
+                    first = i;
+                    if is_item_start(l) {
+                        break;
+                    }
+                }
+                Some((c, ..)) if c > col => continue,
+                _ => break,
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate().take(doc.end).skip(first) {
+        if l.trim().is_empty() || l.trim_start().starts_with('#') {
+            continue;
+        }
+        match key_of(l) {
+            Some((c, key, value)) if c == col => {
+                if i > first && is_item_start(l) {
+                    break; // next list item
+                }
+                out.push((key.to_string(), unquote(value).to_string()));
+            }
+            Some((c, ..)) if c > col => {}
+            _ if content_col(l) > col => {} // nested scalar list items
+            _ => break,
+        }
+    }
+    out
 }
 
 pub fn doc_at(docs: &[Doc], line: usize) -> Option<(usize, &Doc)> {

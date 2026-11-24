@@ -1,0 +1,150 @@
+# Builds kube-lsp for every platform the Zed extension downloads for.
+#
+# - Every push / PR touching kube-lsp: lint, test, cross-platform build,
+#   binaries uploaded as workflow artifacts.
+# - Push to main with a version not yet released: also publishes GitHub
+#   release `kube-lsp-v<version>` with the archives. The extension downloads
+#   the latest release, so bump `version` in kube-lsp/Cargo.toml to ship.
+#
+# Asset names must match `asset_name()` in src/lib.rs.
+name: kube-lsp
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kube-lsp/**"
+      - ".github/workflows/kube-lsp.yml"
+  pull_request:
+    paths:
+      - "kube-lsp/**"
+      - ".github/workflows/kube-lsp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kube-lsp-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    working-directory: kube-lsp
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "kube-lsp -> target"
+          shared-key: test
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        working-directory: .
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "kube-lsp -> target"
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          # The binary must sit at the archive root (the extension expects it there).
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$dist"
+          cd "target/${{ matrix.target }}/release"
+          name="kube-lsp-${{ matrix.target }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a -tzip "$dist/$name.zip" kube-lsp.exe
+          else
+            tar -czf "$dist/$name.tar.gz" kube-lsp
+          fi
+          ls -l "$dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kube-lsp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether this version is released
+        id: version
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' kube-lsp/Cargo.toml | head -1)
+          tag="kube-lsp-v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag already exists; bump version in kube-lsp/Cargo.toml to publish a new release. Binaries are still available as workflow artifacts."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          path: dist
+          pattern: kube-lsp-*
+          merge-multiple: true
+
+      - name: Publish release
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          ls -l dist
+          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+            --title "kube-lsp ${{ steps.version.outputs.version }}" \
+            --target "$GITHUB_SHA" \
+            --generate-notes

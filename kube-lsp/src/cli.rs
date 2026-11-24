@@ -34,7 +34,7 @@ pub fn select_kubeconfig(kubectl: &Kubectl, path: Option<String>, context: Optio
         Some(c) => return Err(format!("context {c:?} is not in {path}")),
         None => choose(&contexts, default.as_deref(), &format!("Contexts in {path}"))?,
     };
-    activate(kubectl, Session { kubeconfig: Some(path), context: Some(context) })
+    activate(kubectl, Session { kubeconfig: Some(path), context: Some(context), namespace: None })
 }
 
 /// `kube-lsp switch-context [NAME]` — within the active kubeconfig.
@@ -47,7 +47,140 @@ pub fn switch_context(kubectl: &Kubectl, context: Option<String>) -> Result<(), 
         None => choose(&contexts, current.as_deref(), "Contexts")?,
     };
     let kubeconfig = session::load().kubeconfig;
-    activate(kubectl, Session { kubeconfig, context: Some(context) })
+    activate(kubectl, Session { kubeconfig, context: Some(context), namespace: None })
+}
+
+/// `kube-lsp set-namespace [NAME]` — `-` clears it (use the context's default).
+pub fn set_namespace(kubectl: &Kubectl, name: Option<String>) -> Result<(), String> {
+    const CONTEXT_DEFAULT: &str = "(use the context's default)";
+    let chosen = match name {
+        Some(n) if n == "-" => CONTEXT_DEFAULT.to_string(),
+        Some(n) => n,
+        None => {
+            let mut names: Vec<String> = kubectl
+                .run(&["get", "namespaces", "-o", "name"], None)?
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("namespace/"))
+                .map(String::from)
+                .collect();
+            names.insert(0, CONTEXT_DEFAULT.into());
+            let current = kubectl.effective_namespace();
+            choose(&names, Some(current.as_str()), &format!("Namespaces in {}", kubectl.current_context()))?
+        }
+    };
+    let mut s = session::load();
+    s.namespace = (chosen != CONTEXT_DEFAULT).then_some(chosen);
+    session::save(&s).map_err(|e| e.to_string())?;
+    println!("Default namespace is now {}.", kubectl.effective_namespace());
+    Ok(())
+}
+
+pub struct LogsOptions {
+    pub target: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub namespace: Option<String>,
+    pub container: Option<String>,
+    pub tail: u32,
+}
+
+/// `kube-lsp logs` — follows logs in the terminal until Ctrl+C.
+///
+/// The target comes from (in order) `--file/--line` (the resource under the
+/// cursor, via Zed task variables), a positional `pod` / `kind/name`, or an
+/// interactive menu of pods and workloads.
+pub fn logs(kubectl: &Kubectl, opts: LogsOptions) -> Result<(), String> {
+    let (selector, namespace, label) = if let (Some(file), Some(line)) = (&opts.file, opts.line) {
+        target_from_file(file, line)?
+    } else if let Some(t) = &opts.target {
+        (vec![crate::kubectl::safe_arg(t, "target")?], opts.namespace.clone(), t.clone())
+    } else {
+        pick_workload(kubectl, opts.namespace.as_deref())?
+    };
+    let namespace = namespace.or(opts.namespace);
+
+    let mut args: Vec<String> = vec!["logs".into()];
+    args.extend(selector);
+    args.extend([
+        "--follow".into(),
+        format!("--tail={}", opts.tail),
+        "--prefix".into(),
+        "--max-log-requests=20".into(),
+    ]);
+    match &opts.container {
+        Some(c) => args.extend(["--container".into(), crate::kubectl::safe_arg(c, "container")?]),
+        None => args.push("--all-containers=true".into()),
+    }
+    if let Some(ns) = &namespace {
+        args.extend(["--namespace".into(), crate::kubectl::safe_arg(ns, "namespace")?]);
+    }
+    let ns_label = namespace.unwrap_or_else(|| kubectl.effective_namespace());
+    println!("Following logs of {label} in {ns_label} ({}). Ctrl+C to stop.\n", kubectl.current_context());
+    let code = kubectl.exec_interactive(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if code != 0 {
+        return Err(format!("kubectl exited with status {code}"));
+    }
+    Ok(())
+}
+
+const WORKLOADS: &[&str] = &["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"];
+
+/// `(kubectl logs selector args, namespace, label)` for the resource at
+/// 1-based `line` of a manifest file.
+fn target_from_file(file: &str, line: usize) -> Result<(Vec<String>, Option<String>, String), String> {
+    use crate::yaml;
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+    let lines = yaml::lines(&text);
+    let docs = yaml::parse(&lines);
+    let (_, doc) = yaml::doc_at(&docs, line.saturating_sub(1)).ok_or("the cursor is not inside a resource")?;
+    let kind = doc.kind.clone().ok_or("the resource under the cursor has no kind")?;
+    let name = doc.name.clone().ok_or("the resource under the cursor has no metadata.name")?;
+    let label = format!("{kind}/{name}");
+    let selector = if kind == "Pod" {
+        vec![format!("pod/{}", crate::kubectl::safe_arg(&name, "name")?)]
+    } else if WORKLOADS.contains(&kind.as_str()) {
+        // A label selector follows every pod, not just the one kubectl would pick.
+        let labels = yaml::pairs_under(&lines, doc, &["spec", "selector", "matchLabels"]);
+        if labels.is_empty() {
+            vec![format!("{}/{name}", kind.to_lowercase())]
+        } else {
+            vec!["--selector".into(), labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",")]
+        }
+    } else {
+        return Err(format!("{label} has no logs; put the cursor on a Pod or workload ({})", WORKLOADS.join(", ")));
+    };
+    Ok((selector, doc.namespace.clone(), label))
+}
+
+fn pick_workload(kubectl: &Kubectl, namespace: Option<&str>) -> Result<(Vec<String>, Option<String>, String), String> {
+    let mut args = vec!["get", "pods,deployments,statefulsets,daemonsets,jobs", "-o", "name"];
+    if let Some(ns) = namespace {
+        args.extend(["--namespace", ns]);
+    }
+    let names: Vec<String> = kubectl.run(&args, None)?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if names.is_empty() {
+        return Err(format!("no pods or workloads in namespace {}", namespace.map(String::from).unwrap_or_else(|| kubectl.effective_namespace())));
+    }
+    let chosen = choose(&names, None, &format!("Workloads in {}", kubectl.current_context()))?;
+    if chosen.starts_with("pod/") {
+        return Ok((vec![chosen.clone()], namespace.map(String::from), chosen));
+    }
+    // Follow all of a workload's pods via its selector.
+    let mut sel_args = vec!["get", chosen.as_str(), "-o", "jsonpath={.spec.selector.matchLabels}"];
+    if let Some(ns) = namespace {
+        sel_args.extend(["--namespace", ns]);
+    }
+    let labels: Option<String> = kubectl
+        .run(&sel_args, None)
+        .ok()
+        .and_then(|j| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&j).ok())
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}"))).collect::<Vec<_>>().join(","))
+        .filter(|s| !s.is_empty());
+    let selector = match labels {
+        Some(l) => vec!["--selector".into(), l],
+        None => vec![chosen.clone()],
+    };
+    Ok((selector, namespace.map(String::from), chosen))
 }
 
 /// `kube-lsp reset-session`
@@ -66,6 +199,7 @@ pub fn status(kubectl: &Kubectl) -> Result<(), String> {
         println!("Session: none (using default kubeconfig)");
     }
     println!("Active:  {}", kubectl.current_context());
+    println!("Namespace: {}", kubectl.effective_namespace());
     match kubectl.server_version() {
         Ok(v) => println!("Server:  {v}"),
         Err(e) => println!("Server:  unreachable ({})", e.lines().next().unwrap_or_default()),

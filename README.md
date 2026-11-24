@@ -25,6 +25,14 @@ JetBrains Kubernetes plugin. It has two parts:
 - **Local checks**: missing `kind` / `apiVersion` / `metadata.name`.
 - **Completion** for `kind:` and `apiVersion:` from the cluster's discovery API,
   with a built-in list when you're offline.
+- **Go to definition** (`F12` / `cmd-click`): jump from a reference to the
+  object it names, anywhere in the workspace. Works for `configMapRef`/`configMapKeyRef`/
+  `configMap` volumes, `secretRef`/`secretKeyRef`/`secret` volumes/`imagePullSecrets`/
+  Ingress TLS, `claimName`, `serviceAccountName`, StatefulSet `serviceName`, Ingress
+  backends, `scaleTargetRef`, RBAC `roleRef` and `subjects`, and the storage, priority,
+  ingress and runtime class names. On a **label selector** (Service `selector`,
+  `matchLabels`) it lists the workloads whose pods carry those labels. Named
+  objects that aren't in the workspace open as live YAML from the cluster.
 - **Outline**: each resource (`Deployment/web`, `Service/web`) appears in the
   outline panel and symbol search.
 - **Snippets**: not included. Install the community
@@ -33,8 +41,8 @@ JetBrains Kubernetes plugin. It has two parts:
 
 **In the Agent panel (MCP context server `kubernetes`):**
 `kubernetes_contexts`, `_api_resources`, `_get`, `_describe`, `_logs`, `_events`,
-`_explain`, `_top`, plus `_use_kubeconfig`, `_use_context` and
-`_reset_session` for choosing the cluster. These tools are always available. The ones that
+`_explain`, `_top`, plus `_use_kubeconfig`, `_use_context`, `_use_namespace`
+and `_reset_session` for choosing the cluster. These tools are always available. The ones that
 change the cluster are `_apply`, `_delete`, `_scale` and `_rollout_restart`.
 Set `read_only: true` to hide them.
 
@@ -52,6 +60,7 @@ To work against another cluster for the session:
 | **Use a kubeconfig file** | Open the file in Zed, press `ctrl-.` (`cmd-.`) anywhere in it, then **Kubernetes: Connect using this kubeconfig** |
 | **Paste a kubeconfig** | `ctrl-n`, paste, set the language to YAML, then save it anywhere and use the same action. If you connect without saving after an edit, the buffer contents are copied to a private file instead (see below) |
 | **Switch context** | `ctrl-.` in any manifest, then **Kubernetes: Switch cluster context…** to pick from the active kubeconfig's contexts |
+| **Set a default namespace** | `ctrl-.`, then **Kubernetes: Set default namespace…**, or the task of the same name (lists every namespace) |
 | **Go back to default** | `ctrl-.`, then **Kubernetes: Disconnect session, use default kubeconfig** |
 | **Ask the Agent** | *"connect to the staging context in ~/kube/staging.yaml"* runs the `kubernetes_use_kubeconfig` tool |
 
@@ -74,6 +83,10 @@ How it behaves:
   keep working. Buffer contents that differ from disk are copied to
   `kube-lsp/kubeconfigs/` (mode 0600 on Unix), and that copy is deleted when
   you disconnect.
+- **The default namespace** applies to manifests without `metadata.namespace`
+  (apply, diff, validation, and so on) and to Agent tools called without a
+  namespace. Manifests that name their namespace keep it. Switching kubeconfig
+  or context resets it to the context's own default.
 - A kubeconfig named `config` with no extension isn't detected as YAML. Fix that
   with `"file_types": { "YAML": ["**/.kube/config"] }` in your settings.
 
@@ -86,12 +99,20 @@ shipped as [tasks](https://zed.dev/docs/tasks) that run `kube-lsp` subcommands:
    [`zed/tasks.json`](zed/tasks.json). Or put them in a project's
    `.zed/tasks.json`.
 2. Optionally bind keys using [`zed/keymap.json`](zed/keymap.json)
-   (`ctrl-alt-k` opens the picker).
+   (`ctrl-alt-k` opens the picker, `ctrl-alt-l` streams logs for the resource
+   under the cursor).
+
+Tasks call `kube-lsp` from PATH. If you rely on the copy the extension
+downloads, put a build on PATH too (`cargo install --path kube-lsp`, or a
+binary from the releases page).
 
 | Task | Runs | Does |
 |---|---|---|
 | Kubernetes: Select kubeconfig… | `kube-lsp select-kubeconfig` | Native file dialog (Windows Forms, macOS `osascript`, Linux `zenity`/`kdialog`; falls back to typing a path), then a numbered context menu |
 | Kubernetes: Switch context… | `kube-lsp switch-context` | Context menu for the active kubeconfig |
+| Kubernetes: Set default namespace… | `kube-lsp set-namespace` | Namespace menu from the cluster |
+| Kubernetes: Stream logs (resource under cursor) | `kube-lsp logs --file $ZED_FILE --line $ZED_ROW` | Follows logs of the Pod or workload under the cursor. Workloads use their `matchLabels`, so every pod is followed, not just one |
+| Kubernetes: Stream logs… | `kube-lsp logs` | Pick a pod or workload from the cluster, then follow its logs |
 | Kubernetes: Use default kubeconfig | `kube-lsp reset-session` | Clears the selection |
 | Kubernetes: Connection status | `kube-lsp status` | Shows the session, the active context and the server version |
 
@@ -102,14 +123,31 @@ For a fixed setup per project, put `kubeconfig`/`context` in the project's
 `.zed/settings.json` under `lsp.kube-lsp.initialization_options` and
 `context_servers.kubernetes.settings`.
 
-## Install (development)
+## Install
+
+The extension finds `kube-lsp` in this order:
+
+1. The `binary.path` / `command.path` setting
+2. `kube-lsp` on PATH (for development builds)
+3. The latest [GitHub release](https://github.com/StrongTheDev/kubernetes-zed-extension/releases),
+   downloaded automatically for your platform (macOS, Linux musl and Windows,
+   each on x86_64 and arm64)
+
+For development:
 
 ```sh
-# 1. Native helper (needs kubectl on PATH)
-cargo install --path kube-lsp
-
-# 2. Zed: command palette → "zed: install dev extension" → pick this folder
+cargo install --path kube-lsp     # needs kubectl on PATH at runtime
+# Zed: command palette → "zed: install dev extension" → pick this folder
 ```
+
+### Releasing kube-lsp
+
+[`.github/workflows/kube-lsp.yml`](.github/workflows/kube-lsp.yml) runs clippy and
+tests, then builds all six targets (with caching) on every push or PR that touches
+`kube-lsp/`. The archives are uploaded as workflow artifacts. On `main`, if the
+version in `kube-lsp/Cargo.toml` has no `kube-lsp-v<version>` release yet, the
+workflow publishes that release with the archives attached. **To ship a new
+binary, bump the version.** Pushes without a bump only produce artifacts.
 
 Optional settings (`~/.config/zed/settings.json`, or `%APPDATA%\Zed\settings.json` on Windows):
 
@@ -121,7 +159,8 @@ Optional settings (`~/.config/zed/settings.json`, or `%APPDATA%\Zed\settings.jso
       "initialization_options": {
         "validateOnSave": true,
         "context": "",          // empty = current-context
-        "kubeconfig": ""
+        "kubeconfig": "",
+        "namespace": ""         // empty = the context's namespace
       }
     }
   },
@@ -144,30 +183,33 @@ Optional settings (`~/.config/zed/settings.json`, or `%APPDATA%\Zed\settings.jso
 | Resource structure view | ✅ outline |
 | Live templates | ➡️ use [kubernetes-snippets](https://github.com/zed-kubernetes/kubernetes-snippets) |
 | Select / paste kubeconfig, switch context | ✅ code actions + prompt, shared with Agent tools |
-| Default namespace per session | ⏳ |
+| Default namespace per session | ✅ code action, task, Agent tool |
 | Field completion (all fields, not just kind/apiVersion) | ⏳ next: build from cluster OpenAPI v3 |
-| Go-to-definition between resources (selector → labels, configMapRef → ConfigMap) | ⏳ |
+| Go-to-definition between resources (selector → labels, configMapRef → ConfigMap) | ✅ workspace-wide, cluster fallback |
+| Find usages (ConfigMap → who mounts it) | ⏳ |
 | Helm chart support (values navigation, `helm template` preview, lint) | ⏳ |
 | Kustomize (`kustomize build` preview, resource references) | ⏳ |
 | Cluster tree browser (Services tool window) | ❌ needs UI: companion GPUI app or Zed fork |
 | Interactive pod shell / port-forward manager | ⏳ via Zed tasks/terminal, then companion app |
-| Log streaming (follow) | ❌ needs UI |
+| Log streaming (follow) | ✅ task in Zed's terminal (all pods of a workload) |
 
 ## Layout
 
 ```
 extension.toml        Zed manifest (language server, context server)
-src/lib.rs            WASM extension: locates/launches kube-lsp
+src/lib.rs            WASM extension: finds or downloads kube-lsp, launches it
 kube-lsp/src/
-  main.rs             CLI entry: `lsp` | `mcp`
+  main.rs             CLI entry: lsp | mcp | session commands | logs
   lsp.rs              Language server
   mcp.rs              MCP server
-  kubectl.rs          kubectl wrapper (timeouts, no console window on Windows)
+  refs.rs             Cross-resource references (go to definition) + workspace index
+  kubectl.rs          kubectl wrapper (cluster/namespace selection, timeouts)
   session.rs          Active cluster selection shared by LSP and MCP
-  cli.rs              select-kubeconfig / switch-context / reset-session / status
+  cli.rs              select-kubeconfig / switch-context / set-namespace / logs / status
+  yaml.rs             Position-preserving manifest analysis
 zed/tasks.json        Command palette entries (Zed tasks)
 zed/keymap.json       Optional key bindings
-  yaml.rs             Position-preserving manifest analysis (+ tests)
+.github/workflows/    kube-lsp release builds, extension check
 examples/demo.yaml    Try hovers/actions here
 ```
 

@@ -13,6 +13,7 @@
 //! | Structure view                       | document symbols (outline panel)             |
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,7 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use serde_json::{json, Value};
 
 use crate::kubectl::{is_connectivity_error, safe_arg, Kubectl};
+use crate::refs::{self, Reference};
 use crate::session::{self, Session};
 use crate::yaml::{self, Doc};
 
@@ -35,7 +37,12 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Commands that choose which cluster everything talks to.
-const SESSION_COMMANDS: &[&str] = &["kube.useKubeconfig", "kube.switchContext", "kube.resetSession"];
+const SESSION_COMMANDS: &[&str] =
+    &["kube.useKubeconfig", "kube.switchContext", "kube.setNamespace", "kube.resetSession"];
+
+/// Prompt buttons get unwieldy beyond this; the task has no such limit.
+const MAX_PROMPT_CHOICES: usize = 20;
+const USE_CONTEXT_DEFAULT: &str = "(use the context's default)";
 
 const WORKLOADS: &[&str] = &["Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"];
 
@@ -78,9 +85,17 @@ impl Client {
         self.send(Message::Notification(Notification::new(method.into(), params)));
     }
 
+    fn next_request_id(&self) -> RequestId {
+        RequestId::from(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn request_with(&self, id: RequestId, method: &str, params: Value) {
+        self.send(Message::Request(Request::new(id, method.into(), params)));
+    }
+
     fn request(&self, method: &str, params: Value) -> RequestId {
-        let id = RequestId::from(self.next_id.fetch_add(1, Ordering::SeqCst));
-        self.send(Message::Request(Request::new(id.clone(), method.into(), params)));
+        let id = self.next_request_id();
+        self.request_with(id.clone(), method, params);
         id
     }
 
@@ -104,11 +119,15 @@ impl Client {
 
 // ---------------------------------------------------------------------------
 
+/// `(kind, apiVersion)` from the discovery API.
+type KindEntry = (String, String);
+
 /// Server->client prompts awaiting the user's answer.
 enum Pending {
-    Delete { manifest: String, label: String },
+    Delete { manifest: String, label: String, ns: Vec<String> },
     /// Pick a context; `kubeconfig` is set when connecting a new file.
     Context { kubeconfig: Option<String>, choices: Vec<String> },
+    Namespace,
 }
 
 struct Server {
@@ -118,8 +137,11 @@ struct Server {
     documents: HashMap<String, String>,
     explain_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// Keyed by cluster identity, so switching clusters doesn't serve stale kinds.
-    kinds_cache: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
+    kinds_cache: Arc<Mutex<HashMap<String, Vec<KindEntry>>>>,
     pending: HashMap<RequestId, Pending>,
+    /// Workspace folders, scanned for go-to-definition targets.
+    roots: Vec<PathBuf>,
+    index: Arc<Mutex<refs::Index>>,
 }
 
 pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
@@ -133,6 +155,7 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
         "completionProvider": { "triggerCharacters": [":", " "] },
         "codeActionProvider": true,
         "documentSymbolProvider": true,
+        "definitionProvider": true,
         "executeCommandProvider": { "commands": commands },
     });
     let init = connection
@@ -149,6 +172,18 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
     }
     if let Some(b) = opt_str("kubectl") {
         kubectl.bin = b;
+    }
+    if let Some(ns) = opt_str("namespace") {
+        kubectl.namespace = Some(ns);
+    }
+    let mut roots: Vec<PathBuf> = init["workspaceFolders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["uri"].as_str().and_then(uri_to_path))
+        .collect();
+    if roots.is_empty() {
+        roots.extend(init["rootUri"].as_str().and_then(uri_to_path));
     }
 
     let raw_sender = connection.sender.clone();
@@ -167,6 +202,8 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
         explain_cache: Default::default(),
         kinds_cache: Default::default(),
         pending: HashMap::new(),
+        roots,
+        index: Default::default(),
     };
 
     for msg in &connection.receiver {
@@ -232,10 +269,11 @@ impl Server {
         };
         let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
         match pending {
-            Pending::Delete { manifest, label } if choice == "Delete" => {
+            Pending::Delete { manifest, label, ns } if choice == "Delete" => {
                 std::thread::spawn(move || {
                     let ctx = kubectl.current_context();
-                    match kubectl.run(&["delete", "-f", "-"], Some(&manifest)) {
+                    let args: Vec<&str> = ["delete", "-f", "-"].into_iter().chain(ns.iter().map(String::as_str)).collect();
+                    match kubectl.run(&args, Some(&manifest)) {
                         Ok(out) => client.show(3, format!("[{ctx}] {}", out.trim())),
                         Err(e) => client.show(1, format!("[{ctx}] delete {label} failed: {e}")),
                     }
@@ -243,7 +281,18 @@ impl Server {
             }
             Pending::Context { kubeconfig, choices } if choices.contains(&choice) => {
                 let kubeconfig = kubeconfig.or_else(|| session::load().kubeconfig);
-                self.activate(Session { kubeconfig, context: Some(choice) });
+                self.activate(Session { kubeconfig, context: Some(choice), namespace: None });
+            }
+            Pending::Namespace => {
+                let mut current = session::load();
+                current.namespace = (choice != USE_CONTEXT_DEFAULT).then_some(choice);
+                match session::save(&current) {
+                    Ok(()) => self.client.show(
+                        3,
+                        format!("Kubernetes: default namespace is now {}", self.kubectl.effective_namespace()),
+                    ),
+                    Err(e) => self.client.show(1, format!("Kubernetes: could not save session: {e}")),
+                }
             }
             _ => {}
         }
@@ -255,6 +304,7 @@ impl Server {
         match req.method.as_str() {
             "textDocument/hover" => self.hover(id, &p),
             "textDocument/completion" => self.completion(id, &p),
+            "textDocument/definition" => self.definition(id, &p),
             "textDocument/codeAction" => {
                 let result = self.code_actions(&p);
                 self.client.respond(id, result);
@@ -306,10 +356,12 @@ impl Server {
             let lines = yaml::lines(&text);
             let mut diags = local;
             for doc in docs.iter().filter(|d| d.is_cluster_object(&lines)) {
-                let out = kubectl.exec(
-                    &["apply", "--dry-run=server", "--validate=strict", "-o", "name", "-f", "-"],
-                    Some(&doc.text(&lines)),
-                );
+                let ns = manifest_ns_args(&kubectl, &[doc]);
+                let args: Vec<&str> = ["apply", "--dry-run=server", "--validate=strict", "-o", "name", "-f", "-"]
+                    .into_iter()
+                    .chain(ns.iter().map(String::as_str))
+                    .collect();
+                let out = kubectl.exec(&args, Some(&doc.text(&lines)));
                 if out.success {
                     continue;
                 }
@@ -467,6 +519,7 @@ impl Server {
         if doc.is_resource() {
             if !doc.is_kubeconfig() {
                 session_actions.push(action("kube.switchContext", "Kubernetes: Switch cluster context...".into(), -1));
+                session_actions.push(action("kube.setNamespace", "Kubernetes: Set default namespace...".into(), -1));
             }
             if session::load().is_active() {
                 session_actions.push(action(
@@ -508,6 +561,7 @@ impl Server {
         let index = args.get(1).and_then(Value::as_i64).unwrap_or(-1);
         match command.as_str() {
             "kube.switchContext" => return self.prompt_context(None),
+            "kube.setNamespace" => return self.prompt_namespace(),
             "kube.resetSession" => {
                 return match session::clear() {
                     Ok(()) => self.client.show(
@@ -527,16 +581,17 @@ impl Server {
         }
         let lines = yaml::lines(&text);
         let docs = yaml::parse(&lines);
-        let (manifest, doc) = if index < 0 {
-            let all: Vec<String> =
-                docs.iter().filter(|d| d.is_cluster_object(&lines)).map(|d| d.text(&lines)).collect();
-            (all.join("\n---\n"), None)
+        let selected: Vec<&Doc> = if index < 0 {
+            docs.iter().filter(|d| d.is_cluster_object(&lines)).collect()
         } else {
             match docs.get(index as usize) {
-                Some(d) => (d.text(&lines), Some(d.clone())),
+                Some(d) => vec![d],
                 None => return self.client.show(1, "Kubernetes: resource no longer exists in file"),
             }
         };
+        let manifest = selected.iter().map(|d| d.text(&lines)).collect::<Vec<_>>().join("\n---\n");
+        let ns = manifest_ns_args(&self.kubectl, &selected);
+        let doc = (index >= 0).then(|| selected[0].clone());
         let label = doc.as_ref().map(Doc::label).unwrap_or_else(|| "all resources".into());
 
         if command == "kube.delete" {
@@ -549,12 +604,12 @@ impl Server {
                     "actions": [{ "title": "Delete" }, { "title": "Cancel" }]
                 }),
             );
-            self.pending.insert(id, Pending::Delete { manifest, label });
+            self.pending.insert(id, Pending::Delete { manifest, label, ns });
             return;
         }
 
         let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
-        std::thread::spawn(move || run_command(&client, &kubectl, &command, &manifest, doc.as_ref(), &label));
+        std::thread::spawn(move || run_command(&client, &kubectl, &command, &manifest, &ns, doc.as_ref(), &label));
     }
 
     // -- cluster selection ---------------------------------------------------
@@ -589,7 +644,7 @@ impl Server {
         };
         if choices.len() == 1 && kubeconfig.is_some() {
             let context = choices.into_iter().next();
-            return self.activate(Session { kubeconfig, context });
+            return self.activate(Session { kubeconfig, context, namespace: None });
         }
         let mut actions: Vec<Value> = choices.iter().map(|c| json!({ "title": c })).collect();
         actions.push(json!({ "title": "Cancel" }));
@@ -604,6 +659,45 @@ impl Server {
         self.pending.insert(id, Pending::Context { kubeconfig, choices });
     }
 
+    /// Lists the cluster's namespaces (network call, so off the main thread)
+    /// and asks for the session's default.
+    fn prompt_namespace(&mut self) {
+        let id = self.client.next_request_id();
+        self.pending.insert(id.clone(), Pending::Namespace);
+        let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
+        std::thread::spawn(move || {
+            let names: Vec<String> = match kubectl.run(&["get", "namespaces", "-o", "name"], None) {
+                Ok(out) => out
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("namespace/"))
+                    .map(String::from)
+                    .collect(),
+                Err(e) => return client.show(1, format!("Kubernetes: could not list namespaces: {e}")),
+            };
+            let current = kubectl.effective_namespace();
+            let mut actions: Vec<Value> =
+                names.iter().take(MAX_PROMPT_CHOICES).map(|n| json!({ "title": n })).collect();
+            actions.push(json!({ "title": USE_CONTEXT_DEFAULT }));
+            let more = if names.len() > MAX_PROMPT_CHOICES {
+                format!(
+                    " Showing {MAX_PROMPT_CHOICES} of {}; the \"Kubernetes: Set default namespace…\" task lists all.",
+                    names.len()
+                )
+            } else {
+                String::new()
+            };
+            client.request_with(
+                id,
+                "window/showMessageRequest",
+                json!({
+                    "type": 3,
+                    "message": format!("Kubernetes: choose the default namespace (currently {current}).{more}"),
+                    "actions": actions
+                }),
+            );
+        });
+    }
+
     fn activate(&mut self, new: Session) {
         if let Err(e) = session::save(&new) {
             return self.client.show(1, format!("Kubernetes: could not save session: {e}"));
@@ -616,6 +710,43 @@ impl Server {
                 format!("Kubernetes: connected to {label} (server {v}). Editor actions and Agent tools now use this cluster."),
             ),
             Err(e) => client.show(2, format!("Kubernetes: switched to {label}, but the cluster is not reachable: {e}")),
+        });
+    }
+
+    // -- go to definition ----------------------------------------------------
+
+    /// Jumps from a reference (`configMapRef.name`, `claimName`, `roleRef`,
+    /// a label selector, …) to the object in the workspace; for named
+    /// references not found locally, opens the live object from the cluster.
+    fn definition(&self, id: RequestId, p: &Value) {
+        let Some((_, text)) = self.text(p) else {
+            return self.client.respond(id, Value::Null);
+        };
+        let line = p["position"]["line"].as_u64().unwrap_or(0) as usize;
+        let lines = yaml::lines(&text);
+        let docs = yaml::parse(&lines);
+        let reference = match yaml::doc_at(&docs, line) {
+            Some((_, doc)) if !doc.is_kubeconfig() && line < lines.len() => refs::reference_at(&lines, doc, line),
+            _ => None,
+        };
+        let Some(reference) = reference else {
+            return self.client.respond(id, Value::Null);
+        };
+        let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
+        let (index, roots, open) = (self.index.clone(), self.roots.clone(), self.documents.clone());
+
+        std::thread::spawn(move || {
+            let all = index.lock().unwrap().collect(&roots, &open, path_to_uri);
+            let hits: Vec<Value> =
+                refs::resolve(&reference, &all).iter().map(|e| location(&e.uri, e.line)).collect();
+            if !hits.is_empty() {
+                return client.respond(id, Value::Array(hits));
+            }
+            let Reference::Named { kind, name, namespace } = reference else {
+                client.show(3, "Kubernetes: no workload in this workspace matches that selector");
+                return client.respond(id, Value::Null);
+            };
+            client.respond(id, live_object_location(&client, &kubectl, &kind, &name, namespace.as_deref()));
         });
     }
 
@@ -654,11 +785,20 @@ fn run_command(
     kubectl: &Kubectl,
     command: &str,
     manifest: &str,
+    ns: &[String],
     doc: Option<&Doc>,
     label: &str,
 ) {
     let ctx = kubectl.current_context();
     let input = Some(manifest);
+    // Manifest (`-f -`) commands, with the default namespace when applicable.
+    let manifest_args = |base: &[&str]| -> Vec<String> {
+        base.iter().map(|s| s.to_string()).chain(ns.iter().cloned()).collect()
+    };
+    let run_manifest = |base: &[&str]| {
+        let args = manifest_args(base);
+        kubectl.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), input)
+    };
     let report = |res: Result<String, String>, verb: &str| match res {
         Ok(out) => client.show(3, format!("[{ctx}] {}", summarize(&out))),
         Err(e) => client.show(1, format!("[{ctx}] {verb} {label} failed: {e}")),
@@ -685,22 +825,20 @@ fn run_command(
     };
 
     match command {
-        "kube.apply" => report(kubectl.run(&["apply", "-f", "-"], input), "apply"),
-        "kube.dryRun" => report(
-            kubectl.run(&["apply", "--dry-run=server", "--validate=strict", "-f", "-"], input),
-            "dry-run",
-        ),
+        "kube.apply" => report(run_manifest(&["apply", "-f", "-"]), "apply"),
+        "kube.dryRun" => report(run_manifest(&["apply", "--dry-run=server", "--validate=strict", "-f", "-"]), "dry-run"),
         "kube.diff" => {
             // `kubectl diff` exits 1 when there *are* differences.
-            let out = kubectl.exec(&["diff", "-f", "-"], input);
+            let args = manifest_args(&["diff", "-f", "-"]);
+            let out = kubectl.exec(&args.iter().map(String::as_str).collect::<Vec<_>>(), input);
             match out.code {
                 Some(0) => client.show(3, format!("[{ctx}] {label}: no differences with the cluster")),
                 Some(1) => open(Ok(out.stdout), "diff", "diff"),
                 _ => open(Err(out.error_text()), "diff", "diff"),
             }
         }
-        "kube.getLive" => open(kubectl.run(&["get", "-f", "-", "-o", "yaml"], input), "live", "yaml"),
-        "kube.describe" => open(kubectl.run(&["describe", "-f", "-"], input), "describe", "txt"),
+        "kube.getLive" => open(run_manifest(&["get", "-f", "-", "-o", "yaml"]), "live", "yaml"),
+        "kube.describe" => open(run_manifest(&["describe", "-f", "-"]), "describe", "txt"),
         "kube.events" => open(
             target().and_then(|(t, ns)| {
                 let mut args = vec!["events".to_string(), "--for".into(), t];
@@ -726,6 +864,52 @@ fn run_command(
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+/// `--namespace <default>` for a manifest, unless one of its documents pins a
+/// different namespace (kubectl rejects that combination).
+fn manifest_ns_args(kubectl: &Kubectl, docs: &[&Doc]) -> Vec<String> {
+    match kubectl.default_namespace() {
+        Some(ns) if docs.iter().all(|d| d.namespace.as_deref().is_none_or(|n| n == ns)) => {
+            vec!["--namespace".into(), ns]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn location(uri: &str, line: usize) -> Value {
+    json!({
+        "uri": uri,
+        "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": 0 } }
+    })
+}
+
+/// Fetches an object from the cluster into a read-only scratch file.
+fn live_object_location(client: &Client, kubectl: &Kubectl, kind: &str, name: &str, namespace: Option<&str>) -> Value {
+    let args = (|| -> Result<Vec<String>, String> {
+        let mut args = vec!["get".into(), safe_arg(kind, "kind")?, safe_arg(name, "name")?, "-o".into(), "yaml".into()];
+        if let Some(ns) = namespace.filter(|_| !refs::is_cluster_scoped(kind)) {
+            args.extend(["-n".into(), safe_arg(ns, "namespace")?]);
+        }
+        Ok(args)
+    })();
+    let fetched = args.and_then(|a| kubectl.run(&a.iter().map(String::as_str).collect::<Vec<_>>(), None));
+    match fetched.and_then(|yaml_text| {
+        write_output("live", &format!("{kind}/{name}"), "yaml", &yaml_text)
+            .map_err(|e| e.to_string())
+            .map(|path| (path, yaml_text))
+    }) {
+        Ok((path, yaml_text)) => {
+            let uri = path_to_uri(&path);
+            let line = refs::entries(&uri, &yaml_text).first().map(|e| e.line).unwrap_or(0);
+            client.show(3, format!("Kubernetes: {kind}/{name} is not in this workspace; opened the live object from the cluster"));
+            location(&uri, line)
+        }
+        Err(e) => {
+            client.show(3, format!("Kubernetes: {kind}/{name} not found in the workspace or cluster ({})", e.lines().next().unwrap_or_default()));
+            Value::Null
+        }
+    }
+}
 
 fn local_diagnostics(lines: &[&str], docs: &[Doc]) -> Vec<Value> {
     let mut diags = Vec::new();

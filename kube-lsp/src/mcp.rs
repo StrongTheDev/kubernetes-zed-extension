@@ -15,7 +15,12 @@ const MAX_OUTPUT: usize = 100_000;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Tools that change which cluster is used (local state only, never the cluster).
-const SESSION_TOOLS: &[&str] = &["kubernetes_use_kubeconfig", "kubernetes_use_context", "kubernetes_reset_session"];
+const SESSION_TOOLS: &[&str] = &[
+    "kubernetes_use_kubeconfig",
+    "kubernetes_use_context",
+    "kubernetes_use_namespace",
+    "kubernetes_reset_session",
+];
 
 struct Tool {
     name: &'static str,
@@ -53,6 +58,16 @@ fn tools() -> Vec<Tool> {
                 "type": "object",
                 "required": ["context"],
                 "properties": { "context": { "type": "string" } }
+            }),
+        },
+        Tool {
+            name: "kubernetes_use_namespace",
+            description: "Set the default namespace for this session (used when a tool call or manifest names none). Pass an empty string to go back to the context's default.",
+            mutating: false,
+            schema: || json!({
+                "type": "object",
+                "required": ["namespace"],
+                "properties": { "namespace": { "type": "string" } }
             }),
         },
         Tool {
@@ -365,7 +380,11 @@ fn call_tool(kubectl: &Kubectl, name: &str, input: &Value) -> Result<String, Str
             } else {
                 String::new()
             };
-            Ok(format!("{header}Active: {}\n\n{list}", kubectl.current_context()))
+            Ok(format!(
+                "{header}Active: {}\nDefault namespace: {}\n\n{list}",
+                kubectl.current_context(),
+                kubectl.effective_namespace()
+            ))
         }
         "kubernetes_use_kubeconfig" => {
             let path = a.str("path").ok_or("missing required argument `path`")?;
@@ -383,7 +402,7 @@ fn call_tool(kubectl: &Kubectl, name: &str, input: &Value) -> Result<String, Str
                     .map(|c| c.trim().to_string())
                     .map_err(|_| format!("file has several contexts; pass one of: {}", contexts.join(", ")))?,
             };
-            activate(kubectl, Session { kubeconfig: Some(path.to_string()), context: Some(context) })
+            activate(kubectl, Session { kubeconfig: Some(path.to_string()), context: Some(context), namespace: None })
         }
         "kubernetes_use_context" => {
             let context = a.str("context").ok_or("missing required argument `context`")?;
@@ -392,7 +411,16 @@ fn call_tool(kubectl: &Kubectl, name: &str, input: &Value) -> Result<String, Str
                 return Err(format!("unknown context {context:?}; available: {}", contexts.join(", ")));
             }
             let kubeconfig = session::load().kubeconfig;
-            activate(kubectl, Session { kubeconfig, context: Some(context.to_string()) })
+            activate(kubectl, Session { kubeconfig, context: Some(context.to_string()), namespace: None })
+        }
+        "kubernetes_use_namespace" => {
+            let mut s = session::load();
+            s.namespace = match input.get("namespace").and_then(Value::as_str).unwrap_or_default() {
+                "" => None,
+                ns => Some(safe_arg(ns, "namespace")?),
+            };
+            session::save(&s).map_err(|e| e.to_string())?;
+            Ok(format!("Default namespace is now {}.", kubectl.effective_namespace()))
         }
         "kubernetes_reset_session" => {
             session::clear().map_err(|e| e.to_string())?;
@@ -452,6 +480,13 @@ fn call_tool(kubectl: &Kubectl, name: &str, input: &Value) -> Result<String, Str
         "kubernetes_apply" => {
             let manifest = a.str("manifest").ok_or("missing required argument `manifest`")?;
             a.push("apply").push("-f").push("-").namespace()?;
+            // Manifest commands don't get the default namespace automatically;
+            // add it when the manifest doesn't pin one itself.
+            if a.str("namespace").is_none() && !manifest.lines().any(|l| l.trim_start().starts_with("namespace:")) {
+                if let Some(ns) = kubectl.default_namespace() {
+                    a.push("--namespace").push(ns);
+                }
+            }
             if a.flag("dry_run") {
                 a.push("--dry-run=server");
             }

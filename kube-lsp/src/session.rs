@@ -14,16 +14,20 @@ use serde_json::{json, Value};
 pub struct Session {
     pub kubeconfig: Option<String>,
     pub context: Option<String>,
+    pub namespace: Option<String>,
 }
 
 impl Session {
     pub fn is_active(&self) -> bool {
-        self.kubeconfig.is_some() || self.context.is_some()
+        self.kubeconfig.is_some() || self.context.is_some() || self.namespace.is_some()
     }
 
     /// e.g. `staging (from prod-clusters.yaml)`.
     pub fn describe(&self) -> String {
-        let ctx = self.context.as_deref().unwrap_or("current-context");
+        let ctx = match &self.namespace {
+            Some(ns) => format!("{}/{ns}", self.context.as_deref().unwrap_or("current-context")),
+            None => self.context.clone().unwrap_or_else(|| "current-context".into()),
+        };
         match &self.kubeconfig {
             Some(k) => format!(
                 "{ctx} (from {})",
@@ -55,7 +59,7 @@ pub fn load() -> Session {
     let Ok(text) = std::fs::read_to_string(session_file()) else { return Session::default() };
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     let field = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
-    Session { kubeconfig: field("kubeconfig"), context: field("context") }
+    Session { kubeconfig: field("kubeconfig"), context: field("context"), namespace: field("namespace") }
 }
 
 pub fn save(session: &Session) -> std::io::Result<()> {
@@ -63,7 +67,11 @@ pub fn save(session: &Session) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let body = json!({ "kubeconfig": session.kubeconfig, "context": session.context });
+    let body = json!({
+        "kubeconfig": session.kubeconfig,
+        "context": session.context,
+        "namespace": session.namespace,
+    });
     std::fs::write(path, serde_json::to_string_pretty(&body).unwrap_or_default())
 }
 
@@ -112,10 +120,13 @@ mod tests {
     fn roundtrip() {
         let file = std::env::temp_dir().join(format!("kube-lsp-session-test-{}.json", std::process::id()));
         std::env::set_var("KUBE_LSP_SESSION_FILE", &file);
-        let s = Session { kubeconfig: Some("/tmp/a.yaml".into()), context: Some("dev".into()) };
+        let s = Session { kubeconfig: Some("/tmp/a.yaml".into()), context: Some("dev".into()), namespace: None };
         save(&s).unwrap();
         assert_eq!(load(), s);
         assert_eq!(s.describe(), "dev (from a.yaml)");
+        let s = Session { namespace: Some("shop".into()), ..s };
+        save(&s).unwrap();
+        assert_eq!(load().describe(), "dev/shop (from a.yaml)");
         clear().unwrap();
         assert!(!load().is_active());
         std::env::remove_var("KUBE_LSP_SESSION_FILE");
