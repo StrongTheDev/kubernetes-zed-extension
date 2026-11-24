@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::kubectl::{safe_arg, Kubectl};
 use crate::session::{self, Session};
+use crate::{manifest, yaml};
 
 const MAX_OUTPUT: usize = 100_000;
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -480,17 +481,26 @@ fn call_tool(kubectl: &Kubectl, name: &str, input: &Value) -> Result<String, Str
         "kubernetes_apply" => {
             let manifest = a.str("manifest").ok_or("missing required argument `manifest`")?;
             a.push("apply").push("-f").push("-").namespace()?;
-            // Manifest commands don't get the default namespace automatically;
-            // add it when the manifest doesn't pin one itself.
-            if a.str("namespace").is_none() && !manifest.lines().any(|l| l.trim_start().starts_with("namespace:")) {
-                if let Some(ns) = kubectl.default_namespace() {
-                    a.push("--namespace").push(ns);
-                }
-            }
             if a.flag("dry_run") {
                 a.push("--dry-run=server");
             }
-            a.run(kubectl, Some(manifest))
+            if a.str("namespace").is_some() {
+                return a.run(kubectl, Some(manifest));
+            }
+            // Documents that name no namespace get the session's default.
+            let lines = yaml::lines(manifest);
+            let docs = yaml::parse(&lines);
+            let docs: Vec<&yaml::Doc> = docs.iter().filter(|d| !d.text(&lines).trim().is_empty()).collect();
+            let mut done = String::new();
+            for batch in manifest::batches(kubectl.default_namespace().as_deref(), &lines, &docs) {
+                let args: Vec<&str> =
+                    a.argv.iter().chain(&batch.namespace).map(String::as_str).collect();
+                match kubectl.run(&args, Some(&batch.manifest)) {
+                    Ok(out) => done.push_str(&out),
+                    Err(e) => return Err(format!("{done}{e}")),
+                }
+            }
+            Ok(done)
         }
         "kubernetes_delete" => a
             .push("delete")

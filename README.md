@@ -19,12 +19,22 @@ JetBrains Kubernetes plugin. It has two parts:
   Apply · Dry-run (server) · Diff against cluster · Open live YAML · Describe ·
   Show events · Show logs (workloads) · Delete (asks first), plus Apply/Diff for
   every resource in the file.
-- **Validation on save**: a server-side `--dry-run=server --validate=strict`.
-  An unknown or duplicate field is marked on its own line. It is skipped quietly
-  when no cluster is reachable.
-- **Local checks**: missing `kind` / `apiVersion` / `metadata.name`.
-- **Completion** for `kind:` and `apiVersion:` from the cluster's discovery API,
-  with a built-in list when you're offline.
+- **Field completion** from the cluster's OpenAPI v3 schemas, CRDs included: field
+  names (required ones first, with type and documentation), enum values and
+  booleans. Plus `kind:` and `apiVersion:` from the discovery API.
+- **Validation while typing** against the same schemas: unknown fields (with a
+  "did you mean"), wrong types (`value: 80` where a string is needed), values
+  outside an enum, missing required fields. Schemas are cached on disk, so both
+  this and completion keep working offline once a cluster has been reached.
+- **Broken references**: a ConfigMap, Secret, PVC, ServiceAccount, Service, … that
+  is neither in the workspace nor in the cluster; a missing `configMapKeyRef` /
+  `secretKeyRef` key; a Service selector that matches nothing; a `targetPort` or
+  Ingress backend port that doesn't exist; a workload whose selector doesn't match
+  its own pod labels. Objects created by kustomize generators, cert-manager,
+  SealedSecrets and ExternalSecrets count as existing. Nothing is reported as
+  missing while the cluster can't be asked.
+- **Validation on save**: a server-side `--dry-run=server --validate=strict`,
+  skipped quietly when no cluster is reachable and for kustomize patches.
 - **Go to definition** (`F12` / `cmd-click`): jump from a reference to the
   object it names, anywhere in the workspace. Works for `configMapRef`/`configMapKeyRef`/
   `configMap` volumes, `secretRef`/`secretKeyRef`/`secret` volumes/`imagePullSecrets`/
@@ -33,6 +43,12 @@ JetBrains Kubernetes plugin. It has two parts:
   ingress and runtime class names. On a **label selector** (Service `selector`,
   `matchLabels`) it lists the workloads whose pods carry those labels. Named
   objects that aren't in the workspace open as live YAML from the cluster.
+- **Find usages** (`shift-alt-F12`) on an object's name or on a reference to it,
+  including the Services and policies whose selector picks a workload.
+- **Rename** (`F2`) an object and every reference to it, across the workspace.
+  Files only: the cluster keeps the old object until you delete it. Zed asks the
+  first language server that can rename, so put this one first:
+  `"languages": { "YAML": { "language_servers": ["kube-lsp", "..."] } }`.
 - **Outline**: each resource (`Deployment/web`, `Service/web`) appears in the
   outline panel and symbol search.
 - **Snippets**: not included. Install the community
@@ -81,8 +97,11 @@ How it behaves:
   takes precedence over the `kubeconfig`/`context` values in settings.
 - **Saved files are used in place**, so relative `certificate-authority:` paths
   keep working. Buffer contents that differ from disk are copied to
-  `kube-lsp/kubeconfigs/` (mode 0600 on Unix), and that copy is deleted when
-  you disconnect.
+  `kube-lsp/kubeconfigs/` (mode 0600 on Unix). That copy is deleted when you
+  disconnect, switch to another kubeconfig or cancel the context prompt.
+- **Results of actions** (describe, logs, live YAML, …) go to `kube-lsp/output/`,
+  readable only by you, and are removed after a day. Jumping to a Secret that
+  isn't in the workspace opens it with its values redacted.
 - **The default namespace** applies to manifests without `metadata.namespace`
   (apply, diff, validation, and so on) and to Agent tools called without a
   namespace. Manifests that name their namespace keep it. Switching kubeconfig
@@ -95,16 +114,19 @@ How it behaves:
 Zed extensions can't add their own command palette actions, so these are
 shipped as [tasks](https://zed.dev/docs/tasks) that run `kube-lsp` subcommands:
 
-1. Command palette, `zed: open tasks`, then paste the entries from
-   [`zed/tasks.json`](zed/tasks.json). Or put them in a project's
-   `.zed/tasks.json`.
+1. In any manifest press `ctrl-.`, then **Kubernetes: Install command palette
+   tasks**. It adds the entries to your Zed `tasks.json` and leaves everything
+   else in that file alone. The action comes back as **Update** when a new version
+   brings more tasks.
 2. Optionally bind keys using [`zed/keymap.json`](zed/keymap.json)
    (`ctrl-alt-k` opens the picker, `ctrl-alt-l` streams logs for the resource
    under the cursor).
 
-Tasks call `kube-lsp` from PATH. If you rely on the copy the extension
-downloads, put a build on PATH too (`cargo install --path kube-lsp`, or a
-binary from the releases page).
+Tasks run the same binary as the editor: the language server keeps a copy of
+itself at a fixed path (`kube-lsp/bin/` next to the session file above) and the
+installed tasks call that, so nothing needs to be on PATH. The entries in
+[`zed/tasks.json`](zed/tasks.json) use `kube-lsp` from PATH instead, for
+pasting into a project's `.zed/tasks.json`.
 
 | Task | Runs | Does |
 |---|---|---|
@@ -115,6 +137,9 @@ binary from the releases page).
 | Kubernetes: Stream logs… | `kube-lsp logs` | Pick a pod or workload from the cluster, then follow its logs |
 | Kubernetes: Use default kubeconfig | `kube-lsp reset-session` | Clears the selection |
 | Kubernetes: Connection status | `kube-lsp status` | Shows the session, the active context and the server version |
+
+With unsaved edits, "resource under cursor" still means what you see: the
+language server tells the task which resource is on which lines.
 
 The same commands work from any terminal, e.g.
 `kube-lsp select-kubeconfig ~/.kube/staging.yaml --context staging`.
@@ -128,16 +153,20 @@ For a fixed setup per project, put `kubeconfig`/`context` in the project's
 The extension finds `kube-lsp` in this order:
 
 1. The `binary.path` / `command.path` setting
-2. `kube-lsp` on PATH (for development builds)
-3. The latest [GitHub release](https://github.com/StrongTheDev/kubernetes-zed-extension/releases),
+2. The latest [GitHub release](https://github.com/StrongTheDev/kubernetes-zed-extension/releases),
    downloaded automatically for your platform (macOS, Linux musl and Windows,
-   each on x86_64 and arm64)
+   each on x86_64 and arm64). Offline, the last downloaded one
+3. `kube-lsp` on PATH
 
-For development:
+The language server and the Agent's context server always get the same one, and
+so do the tasks. `kubectl` must be on PATH.
 
-```sh
-cargo install --path kube-lsp     # needs kubectl on PATH at runtime
-# Zed: command palette → "zed: install dev extension" → pick this folder
+For development, install the extension with "zed: install dev extension" and
+point both settings at your build (a build on PATH is only the last resort):
+
+```jsonc
+"lsp": { "kube-lsp": { "binary": { "path": "…/kube-lsp" } } },
+"context_servers": { "kubernetes": { "command": { "path": "…/kube-lsp", "args": ["mcp"] } } }
 ```
 
 ### Releasing kube-lsp
@@ -158,6 +187,8 @@ Optional settings (`~/.config/zed/settings.json`, or `%APPDATA%\Zed\settings.jso
       // "binary": { "path": "C:/tools/kube-lsp.exe" },
       "initialization_options": {
         "validateOnSave": true,
+        "schemaValidation": true,
+        "checkReferences": true,
         "context": "",          // empty = current-context
         "kubeconfig": "",
         "namespace": ""         // empty = the context's namespace
@@ -179,14 +210,16 @@ Optional settings (`~/.config/zed/settings.json`, or `%APPDATA%\Zed\settings.jso
 | Field docs / quick documentation | ✅ hover (`kubectl explain`) |
 | Apply / delete / diff / dry-run from editor | ✅ code actions |
 | Describe, live YAML, events, logs | ✅ code actions → result buffer, ✅ MCP |
-| Schema validation incl. CRDs | ✅ server-side dry-run on save |
+| Schema validation incl. CRDs | ✅ while typing (OpenAPI v3), server-side dry-run on save |
+| Inspections (broken references, selectors, ports) | ✅ workspace + cluster |
 | Resource structure view | ✅ outline |
 | Live templates | ➡️ use [kubernetes-snippets](https://github.com/zed-kubernetes/kubernetes-snippets) |
 | Select / paste kubeconfig, switch context | ✅ code actions + prompt, shared with Agent tools |
 | Default namespace per session | ✅ code action, task, Agent tool |
-| Field completion (all fields, not just kind/apiVersion) | ⏳ next: build from cluster OpenAPI v3 |
+| Field completion (all fields, not just kind/apiVersion) | ✅ cluster OpenAPI v3, CRDs included |
+| Value completion (names of ConfigMaps, Secrets, …) | ⏳ next |
 | Go-to-definition between resources (selector → labels, configMapRef → ConfigMap) | ✅ workspace-wide, cluster fallback |
-| Find usages (ConfigMap → who mounts it) | ⏳ |
+| Find usages (ConfigMap → who mounts it), rename | ✅ workspace-wide |
 | Helm chart support (values navigation, `helm template` preview, lint) | ⏳ |
 | Kustomize (`kustomize build` preview, resource references) | ⏳ |
 | Cluster tree browser (Services tool window) | ❌ needs UI: companion GPUI app or Zed fork |
@@ -202,7 +235,14 @@ kube-lsp/src/
   main.rs             CLI entry: lsp | mcp | session commands | logs
   lsp.rs              Language server
   mcp.rs              MCP server
-  refs.rs             Cross-resource references (go to definition) + workspace index
+  tree.rs             Positioned YAML tree for validation
+  schema.rs           OpenAPI v3: cache, completion, validation
+  refs.rs             Cross-resource references, usages, workspace index
+  checks.rs           Broken reference / selector / port warnings
+  cluster.rs          Cached cluster lookups for the checks
+  manifest.rs         kubectl input: namespace batching, Secret redaction
+  buffers.rs          Unsaved buffer outlines for tasks
+  install.rs          Task launcher + Zed tasks.json installer
   kubectl.rs          kubectl wrapper (cluster/namespace selection, timeouts)
   session.rs          Active cluster selection shared by LSP and MCP
   cli.rs              select-kubeconfig / switch-context / set-namespace / logs / status

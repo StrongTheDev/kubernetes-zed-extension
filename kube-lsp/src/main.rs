@@ -1,9 +1,16 @@
+mod buffers;
+mod checks;
 mod cli;
+mod cluster;
+mod install;
 mod kubectl;
 mod lsp;
+mod manifest;
 mod mcp;
 mod refs;
+mod schema;
 mod session;
+mod tree;
 mod yaml;
 
 use kubectl::Kubectl;
@@ -21,6 +28,7 @@ USAGE:
     kube-lsp set-namespace [NAME | -]                     `-` = the context's default
     kube-lsp reset-session
     kube-lsp status
+    kube-lsp install-tasks                                add these commands to Zed's tasks
 
   Logs (streams until Ctrl+C):
     kube-lsp logs [POD | KIND/NAME] [--namespace NS] [--container C] [--tail N]
@@ -84,6 +92,7 @@ fn main() {
             logs.namespace = namespace;
             cli::logs(&kubectl, logs)
         }
+        "install-tasks" => install::install_tasks().map(|message| println!("{message}")),
         "reset-session" => cli::reset(&kubectl),
         "status" => cli::status(&kubectl),
         "--version" | "version" => {

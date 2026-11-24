@@ -91,6 +91,9 @@ fn needs_namespace(args: &[&str]) -> bool {
     if args.first().is_some_and(|a| GLOBAL.contains(a)) {
         return false;
     }
+    if args.contains(&"--raw") {
+        return false;
+    }
     // For `logs`, `-f` means --follow, not a manifest file.
     let file_flags: &[&str] = if args.first() == Some(&"logs") { &["--filename"] } else { &["-f", "--filename"] };
     !args.iter().any(|a| {

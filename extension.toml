@@ -1,9 +1,9 @@
 id = "kubernetes"
 name = "Kubernetes"
-version = "0.0.2"
+version = "0.1.0"
 schema_version = 1
 authors = ["kubernetes-zed-extension contributors"]
-description = "Kubernetes support for Zed: kubectl explain on hover, apply/diff/delete/describe/logs code actions, server-side validation, resource outline, per-session cluster selection, and an MCP server so the Agent can browse your cluster."
+description = "Kubernetes support for Zed: field completion and validation from your cluster's schemas, kubectl explain on hover, apply/diff/delete/describe/logs code actions, go to definition, find usages, rename, broken reference warnings, log streaming, per-session cluster selection, and an MCP server so the Agent can browse your cluster."
 repository = "https://github.com/StrongTheDev/kubernetes-zed-extension"
 
 [language_servers.kube-lsp]

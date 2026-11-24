@@ -1,6 +1,7 @@
 // Kubernetes tasks for Zed.
-// Copy these into your global tasks file (command palette: "zed: open tasks")
-// or into a project's .zed/tasks.json. They then appear under "task: spawn".
+// Easiest: run the code action "Kubernetes: Install command palette tasks" in a
+// manifest. By hand: copy these into your tasks file ("zed: open tasks") or a
+// project's .zed/tasks.json; they then need `kube-lsp` on PATH.
 [
   {
     "label": "Kubernetes: Select kubeconfig…",

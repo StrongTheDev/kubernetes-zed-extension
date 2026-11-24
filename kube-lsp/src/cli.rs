@@ -123,16 +123,15 @@ pub fn logs(kubectl: &Kubectl, opts: LogsOptions) -> Result<(), String> {
     Ok(())
 }
 
-const WORKLOADS: &[&str] = &["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"];
+pub const WORKLOADS: &[&str] = &["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"];
 
 /// `(kubectl logs selector args, namespace, label)` for the resource at
 /// 1-based `line` of a manifest file.
 fn target_from_file(file: &str, line: usize) -> Result<(Vec<String>, Option<String>, String), String> {
-    use crate::yaml;
-    let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
-    let lines = yaml::lines(&text);
-    let docs = yaml::parse(&lines);
-    let (_, doc) = yaml::doc_at(&docs, line.saturating_sub(1)).ok_or("the cursor is not inside a resource")?;
+    let resources = crate::buffers::load(std::path::Path::new(file))?;
+    let line = line.saturating_sub(1);
+    let doc =
+        resources.into_iter().find(|r| (r.start..r.end).contains(&line)).ok_or("the cursor is not inside a resource")?;
     let kind = doc.kind.clone().ok_or("the resource under the cursor has no kind")?;
     let name = doc.name.clone().ok_or("the resource under the cursor has no metadata.name")?;
     let label = format!("{kind}/{name}");
@@ -140,7 +139,7 @@ fn target_from_file(file: &str, line: usize) -> Result<(Vec<String>, Option<Stri
         vec![format!("pod/{}", crate::kubectl::safe_arg(&name, "name")?)]
     } else if WORKLOADS.contains(&kind.as_str()) {
         // A label selector follows every pod, not just the one kubectl would pick.
-        let labels = yaml::pairs_under(&lines, doc, &["spec", "selector", "matchLabels"]);
+        let labels = &doc.labels;
         if labels.is_empty() {
             vec![format!("{}/{name}", kind.to_lowercase())]
         } else {

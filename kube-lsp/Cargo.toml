@@ -1,10 +1,11 @@
 [package]
 name = "kube-lsp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Kubernetes language server + MCP server used by the Zed Kubernetes extension"
 
 [dependencies]
 lsp-server = "0.10"
+saphyr-parser = "0.4.0"
 serde_json = "1"

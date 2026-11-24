@@ -108,7 +108,7 @@ pub fn key_of(line: &str) -> Option<(usize, &str, &str)> {
 }
 
 /// Column where meaningful content starts (after indentation and `- `).
-fn content_col(line: &str) -> usize {
+pub fn content_col(line: &str) -> usize {
     let mut col = line.len() - line.trim_start().len();
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix('-') {
@@ -210,9 +210,29 @@ pub fn find_path_line(lines: &[&str], doc: &Doc, dotted: &str) -> Option<usize> 
         .find(|&i| key_of(lines[i]).is_some() && key_path(lines, doc.start, i) == wanted)
 }
 
+/// Pairs of an inline mapping such as `{app: web, tier: front}`.
+pub fn flow_pairs(value: &str) -> Vec<(String, String)> {
+    let Some((inner, _)) = value.strip_prefix('{').and_then(|v| v.split_once('}')) else { return Vec::new() };
+    inner
+        .split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once(':')?;
+            Some((unquote(k).to_string(), unquote(v).to_string()))
+        })
+        .collect()
+}
+
 /// `key: value` pairs directly under the mapping at `prefix`, e.g.
 /// `["spec", "selector", "matchLabels"]`.
 pub fn pairs_under(lines: &[&str], doc: &Doc, prefix: &[&str]) -> Vec<(String, String)> {
+    let inline = (doc.start..doc.end).find_map(|i| {
+        let (_, key, value) = key_of(lines[i])?;
+        (prefix.last() == Some(&key) && value.starts_with('{') && key_path(lines, doc.start, i) == prefix)
+            .then(|| flow_pairs(value))
+    });
+    if let Some(pairs) = inline {
+        return pairs;
+    }
     (doc.start..doc.end)
         .filter_map(|i| {
             let (_, key, value) = key_of(lines[i])?;
@@ -286,6 +306,142 @@ pub fn siblings(lines: &[&str], doc: &Doc, line: usize) -> Vec<(String, String)>
     out
 }
 
+/// Byte range of the (unquoted) value on a `key: value` line.
+pub fn value_range(line: &str) -> Option<(usize, usize)> {
+    let (_, _, raw) = key_of(line)?;
+    let value = unquote(raw);
+    if value.is_empty() {
+        return None;
+    }
+    // `value` is a subslice of `line`, so the offset is exact even when
+    // the same text also occurs in the key or a comment.
+    let start = value.as_ptr() as usize - line.as_ptr() as usize;
+    Some((start, start + value.len()))
+}
+
+fn leading(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn is_blank_or_comment(line: &str) -> bool {
+    let t = line.trim_start();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// Whether a value opens a block scalar (`|`, `>-`, …).
+fn opens_block(value: &str) -> bool {
+    value.starts_with(['|', '>'])
+}
+
+/// Text after the list markers of a line.
+fn content(line: &str) -> &str {
+    line.get(content_col(line)..).unwrap_or_default()
+}
+
+/// Keys enclosing column `col` of `line`, outermost first. Unlike
+/// [`key_path`], this works on lines that are blank or half typed.
+pub fn ancestors(lines: &[&str], doc: &Doc, line: usize, col: usize) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut indent = col;
+    for text in lines[doc.start..line].iter().rev() {
+        if indent == 0 {
+            break;
+        }
+        if let Some((c, key, _)) = key_of(text) {
+            if c < indent {
+                path.push(key.to_string());
+                indent = c;
+            }
+        }
+    }
+    path.reverse();
+    path
+}
+
+/// Whether the cursor is in the text of a `|` or `>` block.
+pub fn in_block_scalar(lines: &[&str], doc: &Doc, line: usize, col: usize) -> bool {
+    let mut indent = if lines[line].trim().is_empty() { col } else { leading(lines[line]) };
+    for text in lines[doc.start..line].iter().rev() {
+        if indent == 0 {
+            return false;
+        }
+        if text.trim().is_empty() {
+            continue;
+        }
+        if let Some((c, _, value)) = key_of(text) {
+            if c < indent {
+                if opens_block(value) {
+                    return true;
+                }
+                indent = c;
+            }
+        } else if leading(text) < indent && opens_block(content(text)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// For every line of `doc`, whether it is the text of a block scalar.
+pub fn block_mask(lines: &[&str], doc: &Doc) -> Vec<bool> {
+    let mut block: Option<usize> = None;
+    lines[doc.start..doc.end]
+        .iter()
+        .map(|text| {
+            if let Some(parent) = block {
+                if text.trim().is_empty() || leading(text) > parent {
+                    return true;
+                }
+                block = None;
+            }
+            match key_of(text) {
+                Some((c, _, value)) if opens_block(value) => block = Some(c),
+                None if !is_blank_or_comment(text) && opens_block(content(text)) => block = Some(leading(text)),
+                _ => {}
+            }
+            false
+        })
+        .collect()
+}
+
+/// Keys of the mapping at column `col` around `line`, without `line` itself.
+/// `starts_item` says that `line` begins a new list item.
+pub fn mapping_keys(lines: &[&str], doc: &Doc, line: usize, col: usize, starts_item: bool) -> Vec<String> {
+    let starts = |l: &str| l.trim_start().starts_with("- ");
+    let mut above = Vec::new();
+    if !starts_item {
+        for text in lines[doc.start..line].iter().rev() {
+            if is_blank_or_comment(text) {
+                continue;
+            }
+            match key_of(text) {
+                Some((c, key, _)) if c == col => {
+                    above.push(key.to_string());
+                    if starts(text) {
+                        break;
+                    }
+                }
+                Some((c, ..)) if c > col => {}
+                _ if leading(text) >= col => {} // scalar list items, block text
+                _ => break,
+            }
+        }
+    }
+    above.reverse();
+    for text in &lines[line + 1..doc.end] {
+        if is_blank_or_comment(text) {
+            continue;
+        }
+        match key_of(text) {
+            Some((c, key, _)) if c == col && !starts(text) => above.push(key.to_string()),
+            Some((c, ..)) if c > col && leading(text) >= col => {}
+            _ if leading(text) > col || (leading(text) == col && starts(text)) => {}
+            _ => break,
+        }
+    }
+    above
+}
+
 pub fn doc_at(docs: &[Doc], line: usize) -> Option<(usize, &Doc)> {
     docs.iter().enumerate().find(|(_, d)| line >= d.start && line < d.end)
 }
@@ -327,6 +483,39 @@ mod tests {
             find_path_line(&l, &docs[0], "spec.template.spec.containers[0].ports[0].containerPort"),
             Some(14)
         );
+    }
+
+    #[test]
+    fn block_scalars_are_not_structure() {
+        let src = "data:\n  a: |\n    x: 1\n\n    y: 2\n  b: 1\nargs:\n  - |\n    z: 1\n  - w\n";
+        let l = lines(src);
+        let doc = &parse(&l)[0];
+        let mask = block_mask(&l, doc);
+        let text: Vec<usize> = mask.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i).collect();
+        assert_eq!(text, [2, 3, 4, 8]);
+        assert!(in_block_scalar(&l, doc, 4, 6));
+        assert!(in_block_scalar(&l, doc, 8, 6));
+        assert!(!in_block_scalar(&l, doc, 5, 3));
+        assert!(!in_block_scalar(&l, doc, 9, 4));
+    }
+
+    #[test]
+    fn inline_mappings() {
+        let src = "kind: Deployment
+spec:
+  selector:
+    matchLabels: {app: \"web\", tier: front} # x
+";
+        let l = lines(src);
+        let want = [("app".to_string(), "web".to_string()), ("tier".to_string(), "front".to_string())];
+        assert_eq!(pairs_under(&l, &parse(&l)[0], &["spec", "selector", "matchLabels"]), want);
+    }
+
+    #[test]
+    fn value_ranges() {
+        assert_eq!(value_range("  name: web # x"), Some((8, 11)));
+        assert_eq!(value_range("- name: \"name\""), Some((9, 13)));
+        assert_eq!(value_range("  name:"), None);
     }
 
     #[test]

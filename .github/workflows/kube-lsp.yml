@@ -14,10 +14,12 @@ on:
     branches: [main]
     paths:
       - "kube-lsp/**"
+      - "zed/tasks.json" # embedded in the binary
       - ".github/workflows/kube-lsp.yml"
   pull_request:
     paths:
       - "kube-lsp/**"
+      - "zed/tasks.json" # embedded in the binary
       - ".github/workflows/kube-lsp.yml"
   workflow_dispatch:
 

@@ -8,8 +8,9 @@
 //! | Field documentation                  | hover → `kubectl explain <kind>.<path>`      |
 //! | Apply / delete / diff with cluster   | code actions (`ctrl-.` / `cmd-.`)            |
 //! | Describe / live YAML / logs / events | code actions that open a result buffer       |
-//! | Schema validation                    | diagnostics from server-side dry-run on save |
-//! | `kind` / `apiVersion` completion     | completion from the cluster discovery API   |
+//! | Schema validation                    | OpenAPI checks while typing, dry-run on save |
+//! | Field completion                     | completion from the cluster's OpenAPI v3     |
+//! | Find usages / rename                 | references and rename across the workspace   |
 //! | Structure view                       | document symbols (outline panel)             |
 
 use std::collections::HashMap;
@@ -20,10 +21,15 @@ use std::sync::{Arc, Mutex};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use serde_json::{json, Value};
 
+use crate::install::{self, TaskState};
 use crate::kubectl::{is_connectivity_error, safe_arg, Kubectl};
-use crate::refs::{self, Reference};
+use crate::manifest::{self, Batch};
+use crate::refs::{self, Place, Reference, Target};
+use crate::schema::{self, Problem, Shape, Spot};
 use crate::session::{self, Session};
+use crate::tree::{self, Pos};
 use crate::yaml::{self, Doc};
+use crate::{buffers, checks, cluster};
 
 const COMMANDS: &[(&str, &str)] = &[
     ("kube.apply", "Apply"),
@@ -38,7 +44,10 @@ const COMMANDS: &[(&str, &str)] = &[
 
 /// Commands that choose which cluster everything talks to.
 const SESSION_COMMANDS: &[&str] =
-    &["kube.useKubeconfig", "kube.switchContext", "kube.setNamespace", "kube.resetSession"];
+    &["kube.useKubeconfig", "kube.switchContext", "kube.setNamespace", "kube.resetSession", "kube.installTasks"];
+
+/// Wait for a pause in typing before checking the document.
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Prompt buttons get unwieldy beyond this; the task has no such limit.
 const MAX_PROMPT_CHOICES: usize = 20;
@@ -124,7 +133,7 @@ type KindEntry = (String, String);
 
 /// Server->client prompts awaiting the user's answer.
 enum Pending {
-    Delete { manifest: String, label: String, ns: Vec<String> },
+    Delete { batch: Batch, label: String },
     /// Pick a context; `kubeconfig` is set when connecting a new file.
     Context { kubeconfig: Option<String>, choices: Vec<String> },
     Namespace,
@@ -133,15 +142,29 @@ enum Pending {
 struct Server {
     client: Client,
     kubectl: Kubectl,
-    validate_on_save: bool,
+    options: Options,
     documents: HashMap<String, String>,
+    /// Bumped on every change, so a slow check can't overwrite newer results.
+    generations: Arc<Mutex<HashMap<String, u64>>>,
     explain_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// Keyed by cluster identity, so switching clusters doesn't serve stale kinds.
     kinds_cache: Arc<Mutex<HashMap<String, Vec<KindEntry>>>>,
     pending: HashMap<RequestId, Pending>,
-    /// Workspace folders, scanned for go-to-definition targets.
+    /// Workspace folders, scanned for references and their targets.
     roots: Vec<PathBuf>,
     index: Arc<Mutex<refs::Index>>,
+    schemas: Arc<schema::Store>,
+    cluster: Arc<cluster::Cache>,
+}
+
+#[derive(Clone, Copy)]
+struct Options {
+    /// Server-side dry-run when a file is opened or saved.
+    validate_on_save: bool,
+    /// OpenAPI checks while typing.
+    schema_validation: bool,
+    /// Warnings about references that lead nowhere.
+    check_references: bool,
 }
 
 pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
@@ -156,6 +179,8 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
         "codeActionProvider": true,
         "documentSymbolProvider": true,
         "definitionProvider": true,
+        "referencesProvider": true,
+        "renameProvider": { "prepareProvider": true },
         "executeCommandProvider": { "commands": commands },
     });
     let init = connection
@@ -164,6 +189,7 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
 
     let opts = init.get("initializationOptions").cloned().unwrap_or(Value::Null);
     let opt_str = |key: &str| opts.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
+    let opt_bool = |key: &str| opts.get(key).and_then(Value::as_bool).unwrap_or(true);
     if let Some(c) = opt_str("context") {
         kubectl.context = Some(c);
     }
@@ -197,14 +223,29 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
     let mut server = Server {
         client,
         kubectl,
-        validate_on_save: opts.get("validateOnSave").and_then(Value::as_bool).unwrap_or(true),
+        options: Options {
+            validate_on_save: opt_bool("validateOnSave"),
+            schema_validation: opt_bool("schemaValidation"),
+            check_references: opt_bool("checkReferences"),
+        },
         documents: HashMap::new(),
+        generations: Default::default(),
         explain_cache: Default::default(),
         kinds_cache: Default::default(),
         pending: HashMap::new(),
         roots,
         index: Default::default(),
+        schemas: Default::default(),
+        cluster: Default::default(),
     };
+
+    let client = server.client.clone();
+    std::thread::spawn(move || {
+        session::sweep();
+        if let Err(e) = install::refresh_launcher() {
+            client.log(format!("could not update the task launcher: {e}"));
+        }
+    });
 
     for msg in &connection.receiver {
         match msg {
@@ -217,6 +258,9 @@ pub fn run(mut kubectl: Kubectl) -> Result<(), String> {
             Message::Notification(n) => server.on_notification(n),
             Message::Response(resp) => server.on_response(resp),
         }
+    }
+    for path in server.documents.keys().filter_map(|u| uri_to_path(u)) {
+        buffers::forget(&path);
     }
     // The writer thread only stops once every sender clone is gone.
     drop(server);
@@ -244,9 +288,18 @@ impl Server {
                     self.publish(&uri, false);
                 }
             }
-            "textDocument/didSave" => self.publish(&uri, true),
+            "textDocument/didSave" => {
+                if let Some(path) = uri_to_path(&uri) {
+                    buffers::forget(&path);
+                }
+                self.publish(&uri, true);
+            }
             "textDocument/didClose" => {
                 self.documents.remove(&uri);
+                self.next_generation(&uri);
+                if let Some(path) = uri_to_path(&uri) {
+                    buffers::forget(&path);
+                }
                 self.client.notify(
                     "textDocument/publishDiagnostics",
                     json!({ "uri": uri, "diagnostics": [] }),
@@ -265,15 +318,17 @@ impl Server {
             .and_then(|r| r["title"].as_str())
             .map(String::from)
         else {
-            return; // dismissed
+            if let Pending::Context { kubeconfig: Some(k), .. } = pending {
+                session::discard_unused(&k); // dismissed: don't keep credentials
+            }
+            return;
         };
         let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
         match pending {
-            Pending::Delete { manifest, label, ns } if choice == "Delete" => {
+            Pending::Delete { batch, label } if choice == "Delete" => {
                 std::thread::spawn(move || {
                     let ctx = kubectl.current_context();
-                    let args: Vec<&str> = ["delete", "-f", "-"].into_iter().chain(ns.iter().map(String::as_str)).collect();
-                    match kubectl.run(&args, Some(&manifest)) {
+                    match run_batch(&kubectl, &["delete", "-f", "-"], &batch) {
                         Ok(out) => client.show(3, format!("[{ctx}] {}", out.trim())),
                         Err(e) => client.show(1, format!("[{ctx}] delete {label} failed: {e}")),
                     }
@@ -283,6 +338,7 @@ impl Server {
                 let kubeconfig = kubeconfig.or_else(|| session::load().kubeconfig);
                 self.activate(Session { kubeconfig, context: Some(choice), namespace: None });
             }
+            Pending::Context { kubeconfig: Some(k), .. } => session::discard_unused(&k), // "Cancel"
             Pending::Namespace => {
                 let mut current = session::load();
                 current.namespace = (choice != USE_CONTEXT_DEFAULT).then_some(choice);
@@ -305,6 +361,12 @@ impl Server {
             "textDocument/hover" => self.hover(id, &p),
             "textDocument/completion" => self.completion(id, &p),
             "textDocument/definition" => self.definition(id, &p),
+            "textDocument/references" => self.references(id, &p),
+            "textDocument/prepareRename" => {
+                let result = self.prepare_rename(&p);
+                self.client.respond(id, result);
+            }
+            "textDocument/rename" => self.rename(id, &p),
             "textDocument/codeAction" => {
                 let result = self.code_actions(&p);
                 self.client.respond(id, result);
@@ -333,35 +395,79 @@ impl Server {
 
     // -- diagnostics --------------------------------------------------------
 
-    fn publish(&self, uri: &str, with_cluster: bool) {
+    fn next_generation(&self, uri: &str) -> u64 {
+        let mut all = self.generations.lock().unwrap();
+        let generation = all.entry(uri.to_string()).or_insert(0);
+        *generation += 1;
+        *generation
+    }
+
+    /// Checks a document in the background. `saved` (also used when a file is
+    /// opened) allows calls to the cluster; otherwise only cached data is used.
+    fn publish(&self, uri: &str, saved: bool) {
         let Some(text) = self.documents.get(uri).cloned() else { return };
-        let lines = yaml::lines(&text);
-        let docs = yaml::parse(&lines);
-        if !docs.iter().any(|d| d.api_version.is_some() || d.kind.is_some()) {
+        let known = self.generations.lock().unwrap().contains_key(uri);
+        let is_manifest = {
+            let lines = yaml::lines(&text);
+            yaml::parse(&lines).iter().any(|d| d.api_version.is_some() || d.kind.is_some())
+        };
+        if !is_manifest && !known {
             return; // Not a Kubernetes manifest; stay out of the way.
         }
-        let local = local_diagnostics(&lines, &docs);
-        let publish = |client: &Client, diags: Vec<Value>| {
-            client.notify(
-                "textDocument/publishDiagnostics",
-                json!({ "uri": uri, "diagnostics": diags }),
-            )
+        let generation = self.next_generation(uri);
+        let generations = self.generations.clone();
+        let (client, uri) = (self.client.clone(), uri.to_string());
+        let analysis = Analysis {
+            kubectl: self.kubectl.clone(),
+            options: self.options,
+            roots: self.roots.clone(),
+            open: self.documents.clone(),
+            index: self.index.clone(),
+            schemas: self.schemas.clone(),
+            cluster: self.cluster.clone(),
         };
-        if !(with_cluster && self.validate_on_save) {
-            publish(&self.client, local);
-            return;
-        }
-        let (client, kubectl, uri) = (self.client.clone(), self.kubectl.clone(), uri.to_string());
         std::thread::spawn(move || {
+            let current = || generations.lock().unwrap().get(&uri) == Some(&generation);
+            let publish = |diags: &[Value]| {
+                if current() {
+                    client.notify("textDocument/publishDiagnostics", json!({ "uri": uri, "diagnostics": diags }));
+                }
+            };
+            if !saved {
+                std::thread::sleep(DEBOUNCE);
+                if !current() {
+                    return;
+                }
+            }
+            if !is_manifest {
+                return publish(&[]);
+            }
             let lines = yaml::lines(&text);
-            let mut diags = local;
+            let docs = yaml::parse(&lines);
+            let path = uri_to_path(&uri);
+            if let Some(path) = path.as_deref().filter(|_| !saved && current()) {
+                buffers::record(path, &text);
+            }
+            let patch = path.as_deref().is_some_and(checks::is_patch);
+            let mut diags = local_diagnostics(&lines, &docs);
+            if saved {
+                publish(&diags); // the rest may wait for the cluster
+            }
+            diags.extend(analysis.run(&uri, &lines, &docs, patch, saved));
+            publish(&diags);
+            // A kustomize patch is not a complete object, so it can't be dry-run.
+            if !saved || !analysis.options.validate_on_save || patch {
+                return;
+            }
+            let kubectl = &analysis.kubectl;
+            let default_ns = kubectl.default_namespace();
             for doc in docs.iter().filter(|d| d.is_cluster_object(&lines)) {
-                let ns = manifest_ns_args(&kubectl, &[doc]);
-                let args: Vec<&str> = ["apply", "--dry-run=server", "--validate=strict", "-o", "name", "-f", "-"]
-                    .into_iter()
-                    .chain(ns.iter().map(String::as_str))
-                    .collect();
-                let out = kubectl.exec(&args, Some(&doc.text(&lines)));
+                if !current() {
+                    return;
+                }
+                let batches = manifest::batches(default_ns.as_deref(), &lines, &[doc]);
+                let base = ["apply", "--dry-run=server", "--validate=strict", "-o", "name", "-f", "-"];
+                let out = kubectl.exec(&batch_args(&base, &batches[0]), Some(&batches[0].manifest));
                 if out.success {
                     continue;
                 }
@@ -370,12 +476,20 @@ impl Server {
                     client.log(format!("skipping server validation: {err}"));
                     break;
                 }
-                diags.push(server_diagnostic(&lines, doc, &err));
+                let found = server_diagnostic(&lines, doc, &err);
+                // Don't repeat what the schema check already says, more precisely.
+                let decoding = err.contains("cannot unmarshal") || err.contains("strict decoding error");
+                let reported = |d: &Value| {
+                    let line = d["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+                    d["severity"] == 1
+                        && (d["range"]["start"]["line"] == found["range"]["start"]["line"]
+                            || (decoding && (doc.start..doc.end).contains(&line)))
+                };
+                if !diags.iter().any(reported) {
+                    diags.push(found);
+                }
             }
-            client.notify(
-                "textDocument/publishDiagnostics",
-                json!({ "uri": uri, "diagnostics": diags }),
-            );
+            publish(&diags);
         });
     }
 
@@ -452,7 +566,7 @@ impl Server {
         } else if let Some(v) = prefix.strip_prefix("apiVersion:") {
             ("apiVersion", v)
         } else {
-            return self.client.respond(id, Value::Null);
+            return self.complete_field(id, &lines, line_no, prefix.len());
         };
         let typed = value.trim_start();
         let start = utf16_len(&prefix[..prefix.len() - typed.len()]);
@@ -500,6 +614,28 @@ impl Server {
         });
     }
 
+    /// Field names and values from the cluster's schemas.
+    fn complete_field(&self, id: RequestId, lines: &[&str], line: usize, col: usize) {
+        let docs = yaml::parse(lines);
+        let found = yaml::doc_at(&docs, line).and_then(|(_, doc)| {
+            let target = (doc.api_version.clone()?, doc.kind.clone()?);
+            (!doc.is_kubeconfig()).then_some(())?;
+            Some((target, schema::spot(lines, doc, line, col)?))
+        });
+        let Some(((api, kind), spot)) = found else {
+            return self.client.respond(id, Value::Null);
+        };
+        let text = lines[line].to_string();
+        let (client, kubectl, schemas) = (self.client.clone(), self.kubectl.clone(), self.schemas.clone());
+        std::thread::spawn(move || {
+            let items = schemas
+                .get(&kubectl, &api, true)
+                .map(|d| completion_items(&d, &kind, &spot, line, &text, col))
+                .unwrap_or_default();
+            client.respond(id, json!({ "isIncomplete": false, "items": items }));
+        });
+    }
+
     // -- code actions & commands --------------------------------------------
 
     fn code_actions(&self, p: &Value) -> Value {
@@ -527,6 +663,16 @@ impl Server {
                     "Kubernetes: Disconnect session, use default kubeconfig".into(),
                     -1,
                 ));
+            }
+        }
+        match install::task_state() {
+            _ if !doc.is_resource() => {}
+            TaskState::Current => {}
+            TaskState::Missing => {
+                session_actions.push(action("kube.installTasks", "Kubernetes: Install command palette tasks".into(), -1));
+            }
+            TaskState::Outdated => {
+                session_actions.push(action("kube.installTasks", "Kubernetes: Update command palette tasks".into(), -1));
             }
         }
         if doc.is_kubeconfig() {
@@ -562,6 +708,12 @@ impl Server {
         match command.as_str() {
             "kube.switchContext" => return self.prompt_context(None),
             "kube.setNamespace" => return self.prompt_namespace(),
+            "kube.installTasks" => {
+                return match install::install_tasks() {
+                    Ok(message) => self.client.show(3, format!("Kubernetes: {message}")),
+                    Err(e) => self.client.show(1, format!("Kubernetes: {e}")),
+                };
+            }
             "kube.resetSession" => {
                 return match session::clear() {
                     Ok(()) => self.client.show(
@@ -589,8 +741,7 @@ impl Server {
                 None => return self.client.show(1, "Kubernetes: resource no longer exists in file"),
             }
         };
-        let manifest = selected.iter().map(|d| d.text(&lines)).collect::<Vec<_>>().join("\n---\n");
-        let ns = manifest_ns_args(&self.kubectl, &selected);
+        let batches = manifest::batches(self.kubectl.default_namespace().as_deref(), &lines, &selected);
         let doc = (index >= 0).then(|| selected[0].clone());
         let label = doc.as_ref().map(Doc::label).unwrap_or_else(|| "all resources".into());
 
@@ -604,12 +755,14 @@ impl Server {
                     "actions": [{ "title": "Delete" }, { "title": "Cancel" }]
                 }),
             );
-            self.pending.insert(id, Pending::Delete { manifest, label, ns });
+            if let Some(batch) = batches.into_iter().next() {
+                self.pending.insert(id, Pending::Delete { batch, label });
+            }
             return;
         }
 
         let (client, kubectl) = (self.client.clone(), self.kubectl.clone());
-        std::thread::spawn(move || run_command(&client, &kubectl, &command, &manifest, &ns, doc.as_ref(), &label));
+        std::thread::spawn(move || run_command(&client, &kubectl, &command, &batches, doc.as_ref(), &label));
     }
 
     // -- cluster selection ---------------------------------------------------
@@ -639,8 +792,18 @@ impl Server {
         };
         let choices = match kubectl.contexts() {
             Ok(c) if !c.is_empty() => c,
-            Ok(_) => return self.client.show(1, "Kubernetes: this kubeconfig defines no contexts"),
-            Err(e) => return self.client.show(1, format!("Kubernetes: invalid kubeconfig: {e}")),
+            other => {
+                if let Some(k) = &kubeconfig {
+                    session::discard_unused(k);
+                }
+                return self.client.show(
+                    1,
+                    match other {
+                        Err(e) => format!("Kubernetes: invalid kubeconfig: {e}"),
+                        Ok(_) => "Kubernetes: this kubeconfig defines no contexts".into(),
+                    },
+                );
+            }
         };
         if choices.len() == 1 && kubeconfig.is_some() {
             let context = choices.into_iter().next();
@@ -738,7 +901,7 @@ impl Server {
         std::thread::spawn(move || {
             let all = index.lock().unwrap().collect(&roots, &open, path_to_uri);
             let hits: Vec<Value> =
-                refs::resolve(&reference, &all).iter().map(|e| location(&e.uri, e.line)).collect();
+                refs::resolve(&reference, &all.entries).iter().map(|e| location(&e.uri, e.line)).collect();
             if !hits.is_empty() {
                 return client.respond(id, Value::Array(hits));
             }
@@ -747,6 +910,85 @@ impl Server {
                 return client.respond(id, Value::Null);
             };
             client.respond(id, live_object_location(&client, &kubectl, &kind, &name, namespace.as_deref()));
+        });
+    }
+
+    // -- find usages and rename ----------------------------------------------
+
+    fn target(&self, p: &Value) -> Option<Target> {
+        let (uri, text) = self.text(p)?;
+        refs::target_at(&uri, &text, p["position"]["line"].as_u64()? as usize)
+    }
+
+    fn references(&self, id: RequestId, p: &Value) {
+        let Some(target) = self.target(p) else {
+            return self.client.respond(id, Value::Null);
+        };
+        let with_declaration = p["context"]["includeDeclaration"].as_bool().unwrap_or(false);
+        let client = self.client.clone();
+        let (index, roots, open) = (self.index.clone(), self.roots.clone(), self.documents.clone());
+        std::thread::spawn(move || {
+            let all = index.lock().unwrap().collect(&roots, &open, path_to_uri);
+            let mut out: Vec<Value> = Vec::new();
+            if with_declaration {
+                out.extend(target.definitions(&all).iter().map(|e| match &e.name_place {
+                    Some(p) => json!({ "uri": e.uri, "range": place_range(p) }),
+                    None => location(&e.uri, e.line),
+                }));
+            }
+            let usages = target.named_usages(&all).into_iter().chain(target.selector_usages(&all));
+            out.extend(usages.map(|u| json!({ "uri": u.uri, "range": place_range(&u.place) })));
+            client.respond(id, Value::Array(out));
+        });
+    }
+
+    fn prepare_rename(&self, p: &Value) -> Value {
+        match self.target(p) {
+            Some(t) => json!({ "range": place_range(&t.place), "placeholder": t.name }),
+            None => Value::Null,
+        }
+    }
+
+    fn rename(&self, id: RequestId, p: &Value) {
+        let new_name = p["newName"].as_str().unwrap_or_default().trim().to_string();
+        let Some(target) = self.target(p) else {
+            return self.client.respond(id, Value::Null);
+        };
+        if let Err(e) = valid_name(&target.kind, &new_name) {
+            return self.client.send(Message::Response(Response::new_err(
+                id,
+                lsp_server::ErrorCode::InvalidParams as i32,
+                e,
+            )));
+        }
+        let client = self.client.clone();
+        let (index, roots, open) = (self.index.clone(), self.roots.clone(), self.documents.clone());
+        std::thread::spawn(move || {
+            let all = index.lock().unwrap().collect(&roots, &open, path_to_uri);
+            let definitions = target.definitions(&all);
+            let defined = !definitions.is_empty();
+            let places = definitions
+                .into_iter()
+                .filter_map(|e| Some((&e.uri, e.name_place.as_ref()?)))
+                .chain(target.named_usages(&all).into_iter().map(|u| (&u.uri, &u.place)));
+            let mut changes: HashMap<String, Vec<Value>> = HashMap::new();
+            for (uri, place) in places {
+                let edit = json!({ "range": place_range(place), "newText": new_name });
+                let edits = changes.entry(uri.clone()).or_default();
+                if !edits.contains(&edit) {
+                    edits.push(edit);
+                }
+            }
+            client.respond(id, json!({ "changes": changes }));
+            let old = &target.name;
+            client.show(
+                3,
+                if defined {
+                    format!("Kubernetes: renamed in files only. Applying creates `{new_name}`; delete `{old}` from the cluster yourself.")
+                } else {
+                    format!("Kubernetes: `{old}` isn't defined in this workspace, so only the references were changed.")
+                },
+            );
         });
     }
 
@@ -784,20 +1026,22 @@ fn run_command(
     client: &Client,
     kubectl: &Kubectl,
     command: &str,
-    manifest: &str,
-    ns: &[String],
+    batches: &[Batch],
     doc: Option<&Doc>,
     label: &str,
 ) {
     let ctx = kubectl.current_context();
-    let input = Some(manifest);
-    // Manifest (`-f -`) commands, with the default namespace when applicable.
-    let manifest_args = |base: &[&str]| -> Vec<String> {
-        base.iter().map(|s| s.to_string()).chain(ns.iter().cloned()).collect()
-    };
-    let run_manifest = |base: &[&str]| {
-        let args = manifest_args(base);
-        kubectl.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), input)
+    // Manifest (`-f -`) commands, with the default namespace where it applies.
+    let run_manifest = |base: &[&str]| -> Result<String, String> {
+        let mut done = String::new();
+        for batch in batches {
+            match run_batch(kubectl, base, batch) {
+                Ok(out) => done.push_str(&out),
+                Err(e) if done.is_empty() => return Err(e),
+                Err(e) => return Err(format!("{e} (already done: {})", summarize(&done))),
+            }
+        }
+        Ok(done)
     };
     let report = |res: Result<String, String>, verb: &str| match res {
         Ok(out) => client.show(3, format!("[{ctx}] {}", summarize(&out))),
@@ -829,12 +1073,19 @@ fn run_command(
         "kube.dryRun" => report(run_manifest(&["apply", "--dry-run=server", "--validate=strict", "-f", "-"]), "dry-run"),
         "kube.diff" => {
             // `kubectl diff` exits 1 when there *are* differences.
-            let args = manifest_args(&["diff", "-f", "-"]);
-            let out = kubectl.exec(&args.iter().map(String::as_str).collect::<Vec<_>>(), input);
-            match out.code {
-                Some(0) => client.show(3, format!("[{ctx}] {label}: no differences with the cluster")),
-                Some(1) => open(Ok(out.stdout), "diff", "diff"),
-                _ => open(Err(out.error_text()), "diff", "diff"),
+            let mut diff = String::new();
+            for batch in batches {
+                let out = kubectl.exec(&batch_args(&["diff", "-f", "-"], batch), Some(&batch.manifest));
+                match out.code {
+                    Some(0) => {}
+                    Some(1) => diff.push_str(&out.stdout),
+                    _ => return open(Err(out.error_text()), "diff", "diff"),
+                }
+            }
+            if diff.is_empty() {
+                client.show(3, format!("[{ctx}] {label}: no differences with the cluster"));
+            } else {
+                open(Ok(diff), "diff", "diff");
             }
         }
         "kube.getLive" => open(run_manifest(&["get", "-f", "-", "-o", "yaml"]), "live", "yaml"),
@@ -865,15 +1116,162 @@ fn run_command(
 // ---------------------------------------------------------------------------
 // Helpers
 
-/// `--namespace <default>` for a manifest, unless one of its documents pins a
-/// different namespace (kubectl rejects that combination).
-fn manifest_ns_args(kubectl: &Kubectl, docs: &[&Doc]) -> Vec<String> {
-    match kubectl.default_namespace() {
-        Some(ns) if docs.iter().all(|d| d.namespace.as_deref().is_none_or(|n| n == ns)) => {
-            vec!["--namespace".into(), ns]
-        }
-        _ => Vec::new(),
+fn batch_args<'a>(base: &[&'a str], batch: &'a Batch) -> Vec<&'a str> {
+    base.iter().copied().chain(batch.namespace.iter().map(String::as_str)).collect()
+}
+
+fn run_batch(kubectl: &Kubectl, base: &[&str], batch: &Batch) -> Result<String, String> {
+    kubectl.run(&batch_args(base, batch), Some(&batch.manifest))
+}
+
+/// Names the API server would accept.
+fn valid_name(kind: &str, name: &str) -> Result<(), String> {
+    let rbac = matches!(kind, "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding");
+    let ok = if rbac {
+        !name.is_empty() && !name.contains(['/', '%', ' ']) && name != "." && name != ".."
+    } else {
+        let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        name.len() <= 253
+            && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+            && edge(name.chars().next())
+            && edge(name.chars().last())
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a valid {kind} name (use lowercase letters, digits, `-` and `.`)"))
     }
+}
+
+fn place_range(p: &Place) -> Value {
+    json!({
+        "start": { "line": p.line, "character": utf16_len(&p.text[..p.start]) },
+        "end": { "line": p.line, "character": utf16_len(&p.text[..p.end]) }
+    })
+}
+
+fn completion_items(
+    doc: &schema::Document,
+    kind: &str,
+    spot: &Spot,
+    line: usize,
+    text: &str,
+    cursor: usize,
+) -> Vec<Value> {
+    let range = |start: usize, end: usize| {
+        json!({
+            "start": { "line": line, "character": utf16_len(&text[..start]) },
+            "end": { "line": line, "character": utf16_len(&text[..end]) }
+        })
+    };
+    let value_items = |schema: &Value, range: Value, prefix: &str| -> Vec<Value> {
+        doc.allowed_values(schema)
+            .into_iter()
+            .map(|v| {
+                json!({
+                    "label": v,
+                    "kind": 12,
+                    "filterText": v,
+                    "textEdit": { "range": range, "newText": format!("{prefix}{v}") }
+                })
+            })
+            .collect()
+    };
+    match spot {
+        Spot::Value { path, col, needs_space } => {
+            let Some(schema) = doc.at(kind, path) else { return Vec::new() };
+            if doc.is_list(schema) {
+                return Vec::new(); // list items go on their own lines
+            }
+            value_items(schema, range(*col, cursor), if *needs_space { " " } else { "" })
+        }
+        Spot::Key { parent, col, in_item, taken, end, has_colon } => {
+            let Some(schema) = doc.at(kind, parent) else { return Vec::new() };
+            let range = range(*col, *end);
+            let dash = if doc.is_list(schema) && !in_item && taken.is_empty() { "- " } else { "" };
+            let fields = doc.fields(schema);
+            if fields.is_empty() {
+                // A list of plain values, such as `accessModes`.
+                return if doc.is_list(schema) { value_items(schema, range, dash) } else { Vec::new() };
+            }
+            let pad = " ".repeat(col + dash.len() + 2);
+            fields
+                .into_iter()
+                .filter(|f| !taken.contains(&f.name))
+                .map(|f| {
+                    let tail = match f.shape {
+                        _ if *has_colon => String::new(),
+                        Shape::Object => format!(":\n{pad}"),
+                        Shape::List => format!(":\n{pad}- "),
+                        Shape::Scalar | Shape::Any => ": ".to_string(),
+                    };
+                    let required = if f.required { " (required)" } else { "" };
+                    json!({
+                        "label": f.name,
+                        "kind": 10,
+                        "detail": format!("{}{required}", f.type_label),
+                        "documentation": { "kind": "markdown", "value": f.description },
+                        "filterText": f.name,
+                        "sortText": format!("{}{}", if f.required { 0 } else { 1 }, f.name),
+                        // The text carries its own indentation.
+                        "insertTextMode": 1,
+                        "textEdit": { "range": range, "newText": format!("{dash}{}{tail}", f.name) }
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+/// Everything about one document that needs no server-side dry-run.
+struct Analysis {
+    kubectl: Kubectl,
+    options: Options,
+    roots: Vec<PathBuf>,
+    open: HashMap<String, String>,
+    index: Arc<Mutex<refs::Index>>,
+    schemas: Arc<schema::Store>,
+    cluster: Arc<cluster::Cache>,
+}
+
+impl Analysis {
+    fn run(&self, uri: &str, lines: &[&str], docs: &[Doc], patch: bool, refresh: bool) -> Vec<Value> {
+        let mut problems: Vec<Problem> = Vec::new();
+        let objects = || docs.iter().filter(|d| d.is_cluster_object(lines));
+        if self.options.schema_validation {
+            for doc in objects() {
+                let (Some(api), Some(kind)) = (&doc.api_version, &doc.kind) else { continue };
+                let Some(schema) = self.schemas.get(&self.kubectl, api, refresh) else { continue };
+                if let Some(root) = tree::parse(lines, doc) {
+                    problems.extend(schema.validate(kind, &root, patch));
+                }
+            }
+        }
+        if self.options.check_references && !patch {
+            let all = self.index.lock().unwrap().collect(&self.roots, &self.open, path_to_uri);
+            let cluster = cluster::View { cache: &self.cluster, kubectl: &self.kubectl, refresh };
+            for doc in objects() {
+                problems.extend(checks::check(uri, lines, doc, &all, &cluster));
+            }
+        }
+        problems.iter().map(|p| problem_diagnostic(lines, p)).collect()
+    }
+}
+
+fn problem_diagnostic(lines: &[&str], p: &Problem) -> Value {
+    let text = lines.get(p.pos.line).copied().unwrap_or_default();
+    let utf16 = |chars: usize| text.chars().take(chars).map(char::len_utf16).sum::<usize>();
+    let Pos { line, start, end } = p.pos;
+    let start = if end == usize::MAX { start.max(text.chars().take_while(|c| c.is_whitespace()).count()) } else { start };
+    json!({
+        "range": {
+            "start": { "line": line, "character": utf16(start) },
+            "end": { "line": line, "character": utf16(end.max(start + 1)) }
+        },
+        "severity": p.severity,
+        "source": "kubernetes",
+        "message": p.message
+    })
 }
 
 fn location(uri: &str, line: usize) -> Value {
@@ -893,6 +1291,8 @@ fn live_object_location(client: &Client, kubectl: &Kubectl, kind: &str, name: &s
         Ok(args)
     })();
     let fetched = args.and_then(|a| kubectl.run(&a.iter().map(String::as_str).collect::<Vec<_>>(), None));
+    // Jumping to a reference shouldn't leave credentials in a file.
+    let fetched = fetched.map(|t| if kind == "Secret" { manifest::redact_secret(&t) } else { t });
     match fetched.and_then(|yaml_text| {
         write_output("live", &format!("{kind}/{name}"), "yaml", &yaml_text)
             .map_err(|e| e.to_string())
@@ -900,7 +1300,7 @@ fn live_object_location(client: &Client, kubectl: &Kubectl, kind: &str, name: &s
     }) {
         Ok((path, yaml_text)) => {
             let uri = path_to_uri(&path);
-            let line = refs::entries(&uri, &yaml_text).first().map(|e| e.line).unwrap_or(0);
+            let line = refs::scan(&uri, &yaml_text).entries.first().map(|e| e.line).unwrap_or(0);
             client.show(3, format!("Kubernetes: {kind}/{name} is not in this workspace; opened the live object from the cluster"));
             location(&uri, line)
         }
@@ -975,14 +1375,12 @@ fn summarize(out: &str) -> String {
 }
 
 fn write_output(verb: &str, label: &str, ext: &str, content: &str) -> std::io::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("kube-lsp");
-    std::fs::create_dir_all(&dir)?;
     let safe: String = label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
         .collect();
-    let path = dir.join(format!("{verb}-{safe}.{ext}"));
-    std::fs::write(&path, content)?;
+    let path = session::output_dir().join(format!("{verb}-{safe}.{ext}"));
+    session::write_private(&path, content.as_bytes())?;
     Ok(path)
 }
 

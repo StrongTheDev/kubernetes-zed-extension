@@ -6,7 +6,7 @@
 //! It overrides the kubeconfig/context from Zed settings until it is reset,
 //! and it never modifies the user's own kubeconfig (no `use-context`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -62,44 +62,19 @@ pub fn load() -> Session {
     Session { kubeconfig: field("kubeconfig"), context: field("context"), namespace: field("namespace") }
 }
 
-pub fn save(session: &Session) -> std::io::Result<()> {
-    let path = session_file();
+/// Creates or replaces a file only the current user can read.
+pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let body = json!({
-        "kubeconfig": session.kubeconfig,
-        "context": session.context,
-        "namespace": session.namespace,
-    });
-    std::fs::write(path, serde_json::to_string_pretty(&body).unwrap_or_default())
-}
-
-pub fn clear() -> std::io::Result<()> {
-    // Pasted kubeconfigs hold credentials; drop our copy along with the session.
-    if let Some(k) = load().kubeconfig {
-        let path = PathBuf::from(k);
-        if path.starts_with(state_dir().join("kubeconfigs")) {
-            let _ = std::fs::remove_file(path);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        builder.create(dir)?;
     }
-    match std::fs::remove_file(session_file()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
-}
-
-/// Persists a pasted (unsaved) kubeconfig so kubectl can read it. The file
-/// holds credentials, so it is owner-only on Unix; on Windows the per-user
-/// LocalAppData directory already restricts access.
-pub fn store_kubeconfig(content: &str) -> std::io::Result<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut h);
-    let dir = state_dir().join("kubeconfigs");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("pasted-{:016x}.yaml", h.finish()));
-
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -107,8 +82,81 @@ pub fn store_kubeconfig(content: &str) -> std::io::Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    use std::io::Write;
-    opts.open(&path)?.write_all(content.as_bytes())?;
+    // On Windows the per-user LocalAppData directory restricts access.
+    opts.open(path)?.write_all(contents)
+}
+
+fn pasted_dir() -> PathBuf {
+    state_dir().join("kubeconfigs")
+}
+
+/// Deletes `kubeconfig` if it is our copy of a pasted one (it holds
+/// credentials) and the session doesn't use it. The user's files are never touched.
+pub fn discard_unused(kubeconfig: &str) {
+    let path = Path::new(kubeconfig);
+    if path.starts_with(pasted_dir()) && load().kubeconfig.as_deref() != Some(kubeconfig) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Removes leftovers of earlier runs: unused pasted kubeconfigs and
+/// command output older than a day.
+pub fn sweep() {
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let active = load().kubeconfig;
+    for dir in [pasted_dir(), output_dir(), state_dir().join("buffers")] {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m.elapsed().is_ok_and(|age| age > DAY));
+            if old && active.as_deref().map(Path::new) != Some(path.as_path()) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Where command results (describe, logs, live YAML, …) are written.
+pub fn output_dir() -> PathBuf {
+    state_dir().join("output")
+}
+
+pub fn save(session: &Session) -> std::io::Result<()> {
+    let path = session_file();
+    let previous = load().kubeconfig;
+    let body = json!({
+        "kubeconfig": session.kubeconfig,
+        "context": session.context,
+        "namespace": session.namespace,
+    });
+    write_private(&path, serde_json::to_string_pretty(&body).unwrap_or_default().as_bytes())?;
+    if let Some(old) = previous {
+        discard_unused(&old);
+    }
+    Ok(())
+}
+
+pub fn clear() -> std::io::Result<()> {
+    let previous = load().kubeconfig;
+    match std::fs::remove_file(session_file()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    if let Some(old) = previous {
+        discard_unused(&old);
+    }
+    Ok(())
+}
+
+/// Persists a pasted (unsaved) kubeconfig so kubectl can read it.
+pub fn store_kubeconfig(content: &str) -> std::io::Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    let path = pasted_dir().join(format!("pasted-{:016x}.yaml", h.finish()));
+    write_private(&path, content.as_bytes())?;
     Ok(path)
 }
 
@@ -127,7 +175,18 @@ mod tests {
         let s = Session { namespace: Some("shop".into()), ..s };
         save(&s).unwrap();
         assert_eq!(load().describe(), "dev/shop (from a.yaml)");
+        // Pasted copies disappear when the session moves on; other files stay.
+        let pasted = store_kubeconfig(&format!("test {}", std::process::id())).unwrap();
+        let mine = std::env::temp_dir().join(format!("kube-lsp-mine-{}.yaml", std::process::id()));
+        std::fs::write(&mine, "x").unwrap();
+        let using = |p: &Path| Session { kubeconfig: Some(p.to_string_lossy().into_owned()), ..Default::default() };
+        save(&using(&pasted)).unwrap();
+        assert!(pasted.exists());
+        save(&using(&mine)).unwrap();
+        assert!(!pasted.exists());
         clear().unwrap();
+        assert!(mine.exists());
+        std::fs::remove_file(mine).unwrap();
         assert!(!load().is_active());
         std::env::remove_var("KUBE_LSP_SESSION_FILE");
     }
